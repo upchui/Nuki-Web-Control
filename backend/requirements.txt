@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+requests
+PyJWT==2.8.0
+python-multipart==0.0.6
+sqlalchemy
+bcrypt

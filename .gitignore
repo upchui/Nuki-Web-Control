@@ -1,0 +1,28 @@
+# Database files
+data/nuki_users.db
+data/nuki_users.db-journal
+data/nuki_users.db-wal
+data/nuki_users.db-shm
+
+# Keep data directory but ignore database files
+data/*
+!data/.gitkeep
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment files (if they contain sensitive data)
+backend/.env
+
+# Docker
+.dockerignore
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

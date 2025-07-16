@@ -1,0 +1,30 @@
+services:
+  backend:
+    build: ./backend
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./data:/app/data
+    networks:
+      - nuki-network
+
+  frontend:
+    build: ./frontend
+    networks:
+      - nuki-network
+
+  nginx:
+    image: nginx:latest
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - nuki-network
+
+networks:
+  nuki-network:
+    driver: bridge

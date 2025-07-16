@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nuki Web Control</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <h1>Nuki Web Control</h1>
+        <nav>
+            <a href="#" class="nav-link active" data-target="smartlocks">Smartlocks</a>
+            <a href="#" class="nav-link" data-target="authorizations">Authorizations</a>
+            <a href="#" class="nav-link" data-target="logs">Logs</a>
+            <a href="#" class="nav-link admin-only" data-target="admin" style="display: none;">Admin</a>
+        </nav>
+        <div class="user-info">
+            <span id="username-display"></span>
+            <button id="logout-button" class="logout-btn">Abmelden</button>
+        </div>
+    </header>
+
+    <main>
+        <div id="smartlocks" class="page-content active">
+            <div class="container">
+                <div class="card">
+                    <h2>Smartlocks</h2>
+                    <button id="sync-all-button">Sync All</button>
+                    <div class="smartlock-filters">
+                        <div class="filter-group">
+                            <label for="smartlock-name-filter">Filter by Name:</label>
+                            <input type="text" id="smartlock-name-filter" placeholder="Search smartlocks...">
+                        </div>
+                        <div class="filter-group">
+                            <label for="smartlock-state-filter">Filter by State:</label>
+                            <select id="smartlock-state-filter">
+                                <option value="">All States</option>
+                                <option value="locked">Locked</option>
+                                <option value="unlocked">Unlocked</option>
+                                <option value="unlatched">Unlatched</option>
+                                <option value="locking">Locking</option>
+                                <option value="unlocking">Unlocking</option>
+                                <option value="unlatching">Unlatching</option>
+                                <option value="uncalibrated">Uncalibrated</option>
+                                <option value="motor blocked">Motor Blocked</option>
+                            </select>
+                        </div>
+                        <div class="filter-actions">
+                            <button id="clear-smartlock-filters-button">Clear Filters</button>
+                        </div>
+                    </div>
+                    <div class="table-container">
+                        <table id="smartlocks-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>State</th>
+                                    <th>Battery</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="smartlocks-container"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="authorizations" class="page-content">
+            <div class="container">
+                <div class="card">
+                    <h2>Authorizations</h2>
+                    <button id="add-auth-button">Create Authorization</button>
+                    <div class="auth-filters">
+                        <div class="filter-group">
+                            <label for="auth-name-filter">Filter by Name:</label>
+                            <input type="text" id="auth-name-filter" placeholder="Search authorizations...">
+                        </div>
+                        <div class="filter-group">
+                            <label for="auth-code-filter">Filter by Code:</label>
+                            <input type="text" id="auth-code-filter" placeholder="Search by code...">
+                        </div>
+                        <div class="filter-group">
+                            <label for="auth-smartlock-filter">Filter by Smartlock:</label>
+                            <select id="auth-smartlock-filter">
+                                <option value="">All Smartlocks</option>
+                            </select>
+                        </div>
+                        <div class="filter-group">
+                            <label for="auth-status-filter">Filter by Status:</label>
+                            <select id="auth-status-filter">
+                                <option value="">All Status</option>
+                                <option value="enabled">Enabled</option>
+                                <option value="disabled">Disabled</option>
+                            </select>
+                        </div>
+                        <div class="filter-actions">
+                            <button id="clear-auth-filters-button">Clear Filters</button>
+                        </div>
+                    </div>
+                    <div class="table-container">
+                        <table id="auths-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Code</th>
+                                    <th>Smartlock</th>
+                                    <th>Status</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="auths-container"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="logs" class="page-content">
+            <div class="container">
+                <div class="card">
+                    <h2>Smart Lock Logs</h2>
+                    <div class="logs-info">
+                        <span id="logs-count">Loading...</span>
+                    </div>
+                    <div class="log-filters">
+                        <div class="filter-group">
+                            <label for="smartlock-filter">Filter by Smart Lock:</label>
+                            <select id="smartlock-filter">
+                                <option value="">All Smart Locks</option>
+                            </select>
+                        </div>
+                        <div class="filter-group">
+                            <label for="log-type-filter">Filter by Type:</label>
+                            <select id="log-type-filter">
+                                <option value="">All Types</option>
+                                <option value="lock">Lock</option>
+                                <option value="unlock">Unlock</option>
+                                <option value="unlatch">Unlatch</option>
+                                <option value="auth">Authorization</option>
+                                <option value="sync">Sync</option>
+                                <option value="error">Error</option>
+                            </select>
+                        </div>
+                        <div class="filter-group">
+                            <label for="date-filter">Filter by Date:</label>
+                            <input type="date" id="date-filter">
+                        </div>
+                        <div class="filter-actions">
+                            <button id="refresh-logs-button">Refresh Logs</button>
+                            <button id="clear-filters-button">Clear Filters</button>
+                        </div>
+                    </div>
+                    <div class="logs-container">
+                        <div class="table-container">
+                            <table id="logs-table">
+                                <thead>
+                                    <tr>
+                                        <th>Timestamp</th>
+                                        <th>Smart Lock</th>
+                                        <th>Type</th>
+                                        <th>Message</th>
+                                        <th>User/Auth</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="logs-container"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="admin" class="page-content">
+            <div class="container">
+                <div class="card">
+                    <h2>User Management</h2>
+                    <button id="add-user-button">Create User</button>
+                    <div class="table-container">
+                        <table id="users-table">
+                            <thead>
+                                <tr>
+                                    <th>Username</th>
+                                    <th>Admin</th>
+                                    <th>Created</th>
+                                    <th>Last Login</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="users-container"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </main>
+
+    <!-- Modals -->
+
+    <div id="auth-modal" class="modal">
+        <div class="modal-content">
+            <span class="close-button">&times;</span>
+            <h3 id="auth-modal-title">Create Authorization</h3>
+            <form id="auth-form">
+                <input type="hidden" id="auth-id">
+                <input type="hidden" id="original-smartlock-ids">
+                <input type="hidden" id="original-pin-code">
+                <input type="text" id="auth-name" placeholder="Name" required>
+                <div class="form-group">
+                    <label>Smartlocks:</label>
+                    <div id="auth-smartlock-select" class="multi-select-container">
+                        <!-- Smartlock options will be populated by JS -->
+                    </div>
+                </div>
+                <input type="hidden" id="auth-type-select" value="13">
+                <div id="pin-container">
+                    <label for="auth-code">Keypad Code</label>
+                    <div class="pin-inputs">
+                        <input type="text" class="pin-input" maxlength="1" pattern="[1-9]">
+                        <input type="text" class="pin-input" maxlength="1" pattern="[1-9]">
+                        <input type="text" class="pin-input" maxlength="1" pattern="[1-9]">
+                        <input type="text" class="pin-input" maxlength="1" pattern="[1-9]">
+                        <input type="text" class="pin-input" maxlength="1" pattern="[1-9]">
+                        <input type="text" class="pin-input" maxlength="1" pattern="[1-9]">
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="auth-enabled">
+                        Authorization Enabled
+                    </label>
+                </div>
+
+                <div class="form-group time-limit-toggle-group">
+                    <label class="switch">
+                        <input type="checkbox" id="time-limit-toggle">
+                        <span class="slider round"></span>
+                    </label>
+                    <label for="time-limit-toggle" class="toggle-label">Enable Time-Limited Access</label>
+                </div>
+
+                <div id="time-restriction-panel" class="time-restriction-panel" style="display: none;">
+                    <!-- Time restriction content will be generated by JS -->
+                </div>
+
+                <!--<div id="fingerprints-section" class="fingerprints-section" style="display: none;">
+                    <h4>Fingerprints</h4>
+                    <div id="fingerprints-list"> -->
+                        <!-- Fingerprints will be populated by JS -->
+                    <!-- </div>
+                </div>-->
+
+                <div class="form-actions">
+                    <button type="submit" class="btn-primary">Save Authorization</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- User Management Modals -->
+    
+    <div id="user-modal" class="modal">
+        <div class="modal-content">
+            <span class="close-button">&times;</span>
+            <h3 id="user-modal-title">Create User</h3>
+            <form id="user-form">
+                <input type="hidden" id="user-id">
+                <div class="form-group">
+                    <label for="user-username">Username:</label>
+                    <input type="text" id="user-username" required>
+                </div>
+                <div class="form-group">
+                    <label for="user-password">Password:</label>
+                    <input type="password" id="user-password" required>
+                </div>
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="user-is-admin">
+                        Administrator
+                    </label>
+                </div>
+                <div class="form-actions">
+                    <button type="submit" class="btn-primary">Save User</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div id="permissions-modal" class="modal">
+        <div class="modal-content large-modal">
+            <span class="close-button">&times;</span>
+            <h3 id="permissions-modal-title">User Permissions</h3>
+            <form id="permissions-form">
+                <input type="hidden" id="permissions-user-id">
+                
+                <div class="permissions-section">
+                    <h4>Smartlock Access</h4>
+                    <div id="smartlock-permissions" class="permissions-grid">
+                        <!-- Smartlock permissions will be populated by JS -->
+                    </div>
+                </div>
+
+                <div class="permissions-section">
+                    <h4>Authorization Permissions</h4>
+                    <p class="help-text">Note: These permissions only apply to smartlocks where the user has Smartlock Access configured above.</p>
+                    <div class="form-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="can-create-auth">
+                            Can create authorizations
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="can-edit-auth">
+                            Can edit authorizations
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="can-delete-auth">
+                            Can delete authorizations
+                        </label>
+                    </div>
+                </div>
+
+                <div class="permissions-section">
+                    <h4>Specific Authorization Access</h4>
+                    <div id="specific-auth-permissions" class="permissions-grid">
+                        <!-- Specific auth permissions will be populated by JS -->
+                    </div>
+                </div>
+
+                <div class="form-actions">
+                    <button type="submit" class="btn-primary">Save Permissions</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div id="blocking-overlay" class="blocking-overlay" style="display: none;"></div>
+    <script src="app.js"></script>
+</body>
+</html>
