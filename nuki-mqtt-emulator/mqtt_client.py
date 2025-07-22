@@ -178,9 +178,10 @@ class MQTTDataStore:
             # Add keypad codes as authorizations
             for smartlock_id, codes in self.keypad_codes.items():
                 for code in codes:
-                    # Keep the ID as string of codeId (as requested by user)
+                    # Generate globally unique IDs by combining smartlock_id and codeId
                     code_id = code.get("codeId", "unknown")
-                    auth_id = str(code_id)
+                    auth_id = f"{smartlock_id}_{code_id}"  # Unique string ID
+                    unique_auth_id = smartlock_id * 100000 + int(code_id) if str(code_id).isdigit() else smartlock_id * 100000  # Unique numeric authId
                     
                     # Convert date format from "2025-07-22 01:22:21" to "2025-07-22T01:22:21.000Z"
                     def convert_date(date_str):
@@ -222,11 +223,11 @@ class MQTTDataStore:
                     date_created = code.get("dateCreated")
                     time_limited = code.get("timeLimited", 0)
                     
-                    # Base authorization object
+                    # Base authorization object with unique IDs
                     auth = {
-                        "id": auth_id,  # Keep as string of codeId as requested
+                        "id": auth_id,  # Unique string ID: "smartlockId_codeId"
                         "smartlockId": smartlock_id,  # Use original smartlock ID from MQTT
-                        "authId": code.get("codeId"),  # Keep original numeric authId
+                        "authId": unique_auth_id,  # Unique numeric authId
                         "code": code.get("code"),
                         "type": 13,  # Keypad type
                         "name": code.get("name", "Unknown"),
@@ -288,16 +289,20 @@ class MQTTDataStore:
             if auth_id in self.authorizations:
                 return self.authorizations[auth_id]
             
-            # Then check keypad codes (convert to authorization format)
+            # Then check keypad codes using new unique ID format
             for smartlock_id, codes in self.keypad_codes.items():
                 for code in codes:
-                    if str(code.get("codeId")) == auth_id:
-                        # Convert keypad code to authorization format
-                        auth = self._convert_keypad_to_auth(code, smartlock_id)
+                    code_id = code.get("codeId", "unknown")
+                    # Check both old format (just codeId) and new format (smartlockId_codeId)
+                    expected_new_id = f"{smartlock_id}_{code_id}"
+                    if str(code_id) == auth_id or expected_new_id == auth_id:
+                        # Convert keypad code to authorization format with unique IDs
+                        auth = self._convert_keypad_to_auth_unique(code, smartlock_id)
                         # Register the ID mapping for future reference
                         numeric_id = code.get("codeId")
                         if numeric_id:
-                            self.id_mapper.register_mapping(auth_id, numeric_id)
+                            unique_auth_id = smartlock_id * 100000 + int(numeric_id) if str(numeric_id).isdigit() else smartlock_id * 100000
+                            self.id_mapper.register_mapping(expected_new_id, unique_auth_id)
                         return auth
             
             return None
@@ -334,7 +339,7 @@ class MQTTDataStore:
         return True
     
     def _convert_keypad_to_auth(self, code: Dict[str, Any], smartlock_id: int) -> Dict[str, Any]:
-        """Convert keypad code to authorization format"""
+        """Convert keypad code to authorization format (legacy method)"""
         code_id = code.get("codeId", "unknown")
         auth_id = str(code_id)
         
@@ -381,6 +386,76 @@ class MQTTDataStore:
             "id": auth_id,
             "smartlockId": smartlock_id,
             "authId": code.get("codeId"),
+            "code": code.get("code"),
+            "type": 13,  # Keypad type
+            "name": code.get("name", "Unknown"),
+            "enabled": bool(code.get("enabled", 1)),
+            "remoteAllowed": True,
+            "lockCount": code.get("lockCount", 0),
+            "creationDate": convert_date(date_created)
+        }
+        
+        # Only add time-related fields if timeLimited is 1
+        if time_limited == 1:
+            auth.update({
+                "allowedFromDate": convert_date(allowed_from),
+                "allowedUntilDate": convert_date(allowed_until),
+                "allowedWeekDays": weekday_bits,
+                "allowedFromTime": convert_time_to_minutes(allowed_from_time),
+                "allowedUntilTime": convert_time_to_minutes(allowed_until_time),
+            })
+        
+        return auth
+    
+    def _convert_keypad_to_auth_unique(self, code: Dict[str, Any], smartlock_id: int) -> Dict[str, Any]:
+        """Convert keypad code to authorization format with unique IDs"""
+        code_id = code.get("codeId", "unknown")
+        auth_id = f"{smartlock_id}_{code_id}"  # Unique string ID
+        unique_auth_id = smartlock_id * 100000 + int(code_id) if str(code_id).isdigit() else smartlock_id * 100000  # Unique numeric authId
+        
+        # Convert date format from "2025-07-22 01:22:21" to "2025-07-22T01:22:21.000Z"
+        def convert_date(date_str):
+            if not date_str or date_str == "0000-00-00 00:00:00":
+                return None
+            try:
+                from datetime import datetime
+                dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+                return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            except:
+                return None
+        
+        # Convert weekdays to bit representation
+        weekdays = code.get("allowedWeekdays", [])
+        weekday_bits = 0
+        if weekdays and len(weekdays) > 0:
+            weekday_map = {"mon": 1, "tue": 4, "wed": 8, "thu": 32, "fri": 16, "sat": 64, "sun": 2}
+            weekday_bits = sum(weekday_map.get(day.lower(), 0) for day in weekdays)
+        
+        # Convert time to minutes
+        def convert_time_to_minutes(time_str):
+            if not time_str:
+                return 0
+            if time_str == "00:00":
+                return 0
+            try:
+                hours, minutes = map(int, time_str.split(":"))
+                return hours * 60 + minutes
+            except:
+                return 0
+        
+        # Get values
+        allowed_from = code.get("allowedFrom")
+        allowed_until = code.get("allowedUntil") 
+        allowed_from_time = code.get("allowedFromTime")
+        allowed_until_time = code.get("allowedUntilTime")
+        date_created = code.get("dateCreated")
+        time_limited = code.get("timeLimited", 0)
+        
+        # Base authorization object with unique IDs
+        auth = {
+            "id": auth_id,  # Unique string ID: "smartlockId_codeId"
+            "smartlockId": smartlock_id,
+            "authId": unique_auth_id,  # Unique numeric authId
             "code": code.get("code"),
             "type": 13,  # Keypad type
             "name": code.get("name", "Unknown"),

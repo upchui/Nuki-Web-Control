@@ -392,9 +392,25 @@ def update_smartlock_auth(smartlock_id: int, auth_id: str, auth: SmartlockAuthUp
 
 def _convert_api_to_mqtt_keypad(auth: SmartlockAuthUpdate, auth_id: str) -> dict:
     """Convert API format to MQTT keypad action format"""
+    
+    # Extract the original codeId from the unique ID format
+    if "_" in auth_id:
+        # New format: "smartlockId_codeId"
+        parts = auth_id.split("_")
+        if len(parts) == 2 and parts[1].isdigit():
+            numeric_code_id = int(parts[1])
+        else:
+            raise ValueError(f"Invalid unique ID format: {auth_id}")
+    else:
+        # Old format: just the codeId
+        if auth_id.isdigit():
+            numeric_code_id = int(auth_id)
+        else:
+            raise ValueError(f"Cannot determine numeric codeId from auth_id: {auth_id}")
+    
     action_data = {
         "action": "update",
-        "codeId": int(auth_id),  # MQTT expects numeric codeId
+        "codeId": numeric_code_id,  # MQTT expects numeric codeId
         "name": auth.name
     }
     
@@ -468,18 +484,23 @@ def delete_smartlock_auth(auth_ids: list[str]):
             if auth.get("type") == 13:
                 # This is a keypad code - delete via keypad action
                 try:
-                    # Use the ID mapper to get the correct numeric ID
-                    numeric_id = mqtt_client.data_store.id_mapper.get_numeric_id(auth_id)
-                    if numeric_id is None:
-                        # Fallback: use authId from the authorization object
-                        numeric_id = auth.get("authId")
-                    
-                    if numeric_id is None:
-                        # Last resort: try to parse the string ID
+                    # Extract the original codeId from the unique ID format
+                    if "_" in auth_id:
+                        # New format: "smartlockId_codeId"
+                        parts = auth_id.split("_")
+                        if len(parts) == 2 and parts[1].isdigit():
+                            numeric_id = int(parts[1])
+                        else:
+                            raise ValueError(f"Invalid unique ID format: {auth_id}")
+                    else:
+                        # Old format: just the codeId
                         if auth_id.isdigit():
                             numeric_id = int(auth_id)
                         else:
-                            raise ValueError(f"Cannot determine numeric ID for keypad code {auth_id}")
+                            # Try to get from authId field
+                            numeric_id = auth.get("authId")
+                            if numeric_id is None:
+                                raise ValueError(f"Cannot determine numeric ID for keypad code {auth_id}")
                     
                     action_data = {
                         "action": "delete",
