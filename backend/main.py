@@ -111,12 +111,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-NUKI_API_URL = "https://api.nuki.io"
+NUKI_API_URL = os.getenv("NUKI_API_URL", "https://api.nuki.io")
 API_TOKEN = os.getenv("NUKI_API_TOKEN")
 JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-change-this")
 
 if not API_TOKEN:
     raise RuntimeError("NUKI_API_TOKEN environment variable not set")
+
+# Log which API we're using
+logging.info(f"Using Nuki API at: {NUKI_API_URL}")
 
 headers = {
     "Authorization": f"Bearer {API_TOKEN}",
