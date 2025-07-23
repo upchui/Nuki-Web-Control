@@ -200,7 +200,7 @@ class MQTTDataStore:
                     weekday_bits = 0
                     if weekdays and len(weekdays) > 0:
                         # Corrected weekday mapping to match expected output
-                        weekday_map = {"mon": 1, "tue": 4, "wed": 8, "thu": 32, "fri": 16, "sat": 64, "sun": 2}
+                        weekday_map = {"mon": 64, "tue": 32, "wed": 16, "thu": 8, "fri": 4, "sat": 2, "sun": 1}
                         weekday_bits = sum(weekday_map.get(day.lower(), 0) for day in weekdays)
                     
                     # Convert time to minutes - FIXED to return 0 for "00:00"
@@ -358,7 +358,7 @@ class MQTTDataStore:
         weekdays = code.get("allowedWeekdays", [])
         weekday_bits = 0
         if weekdays and len(weekdays) > 0:
-            weekday_map = {"mon": 1, "tue": 4, "wed": 8, "thu": 32, "fri": 16, "sat": 64, "sun": 2}
+            weekday_map = {"mon": 64, "tue": 32, "wed": 16, "thu": 8, "fri": 4, "sat": 2, "sun": 1}
             weekday_bits = sum(weekday_map.get(day.lower(), 0) for day in weekdays)
         
         # Convert time to minutes
@@ -428,7 +428,7 @@ class MQTTDataStore:
         weekdays = code.get("allowedWeekdays", [])
         weekday_bits = 0
         if weekdays and len(weekdays) > 0:
-            weekday_map = {"mon": 1, "tue": 4, "wed": 8, "thu": 32, "fri": 16, "sat": 64, "sun": 2}
+            weekday_map = {"mon": 64, "tue": 32, "wed": 16, "thu": 8, "fri": 4, "sat": 2, "sun": 1}
             weekday_bits = sum(weekday_map.get(day.lower(), 0) for day in weekdays)
         
         # Convert time to minutes

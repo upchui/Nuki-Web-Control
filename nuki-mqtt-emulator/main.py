@@ -232,7 +232,7 @@ def create_smartlock_auth(auth: SmartlockAuthCreate):
                     mqtt_action_data["allowedUntil"] = auth.allowedUntilDate.replace("T", " ").replace(".000Z", "")
                 if auth.allowedWeekDays:
                     # Convert bit representation to weekday names
-                    weekday_map = {1: "mon", 4: "tue", 8: "wed", 32: "thu", 16: "fri", 64: "sat", 2: "sun"}
+                    weekday_map = {64: "mon", 32: "tue", 16: "wed", 8: "thu", 4: "fri", 2: "sat", 1: "sun"}
                     weekdays = []
                     for bit, day in weekday_map.items():
                         if auth.allowedWeekDays & bit:
@@ -430,7 +430,7 @@ def _convert_api_to_mqtt_keypad(auth: SmartlockAuthUpdate, auth_id: str) -> dict
     
     # Weekdays conversion: 36 -> ["tue", "thu"]
     if auth.allowedWeekDays is not None:
-        weekday_map = {1: "mon", 4: "tue", 8: "wed", 32: "thu", 16: "fri", 64: "sat", 2: "sun"}
+        weekday_map = {64: "mon", 32: "tue", 16: "wed", 8: "thu", 4: "fri", 2: "sat", 1: "sun"}
         weekdays = []
         for bit, day in weekday_map.items():
             if auth.allowedWeekDays & bit:
