@@ -259,29 +259,6 @@ class MQTTDataStore:
             
             return auth_list
     
-    def _convert_weekdays_to_bits(self, weekdays: List[str]) -> Optional[int]:
-        """Convert weekday names to bit representation"""
-        if not weekdays:
-            return None
-        
-        weekday_map = {"mon": 1, "tue": 2, "wed": 4, "thu": 8, "fri": 16, "sat": 32, "sun": 64}
-        weekday_bits = sum(weekday_map.get(day.lower(), 0) for day in weekdays)
-        return weekday_bits if weekday_bits != 127 else None  # Return None for all days
-    
-    def _convert_time_to_minutes(self, time_str: str) -> Optional[int]:
-        """Convert HH:MM time string to minutes from midnight"""
-        if not time_str or time_str == "00:00":
-            return None
-        
-        try:
-            if ":" in time_str:
-                hours, minutes = map(int, time_str.split(":"))
-                return hours * 60 + minutes
-            else:
-                return int(time_str)
-        except (ValueError, TypeError):
-            return None
-    
     def get_authorization(self, auth_id: str) -> Optional[Dict[str, Any]]:
         """Get a specific authorization - check both regular auths and keypad codes"""
         with self.lock:
