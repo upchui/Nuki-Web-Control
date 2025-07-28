@@ -1746,7 +1746,7 @@ document.addEventListener('DOMContentLoaded', () => {
         .then(async data => {
             if (data && data.username) {
                 // Token is valid, show username
-                usernameDisplay.textContent = `Willkommen, ${data.username}`;
+                usernameDisplay.textContent = `Welcome, ${data.username}`;
                 
                 // Show admin menu if user is admin
                 if (data.is_admin) {
