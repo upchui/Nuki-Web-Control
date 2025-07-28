@@ -821,15 +821,15 @@ class MQTTDataStore:
         
         return resolved_name
     
-    def get_logs(self, smartlock_id: Optional[int] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_logs(self, smartlock_id: Optional[int] = None, limit: int = 10000) -> List[Dict[str, Any]]:
         """Get log entries"""
         with self.lock:
             logs = self.logs
             if smartlock_id is not None:
                 logs = [log for log in logs if log.get("smartlockId") == smartlock_id]
             
-            # Sort by timestamp descending and limit
-            logs = sorted(logs, key=lambda x: x.get("timestamp", ""), reverse=True)
+            # Sort by date descending and limit
+            logs = sorted(logs, key=lambda x: x.get("date", ""), reverse=True)
             return logs[:limit]
     
     def get_account_users(self) -> List[Dict[str, Any]]:

@@ -145,11 +145,21 @@ document.addEventListener('DOMContentLoaded', () => {
             // Try fetching from general endpoint with different date ranges
             for (const range of dateRanges) {
                 try {
-                    const params = new URLSearchParams({ limit: '50' });
+                    const params = new URLSearchParams({ limit: '10000' });
                     if (range.fromDate) params.append('fromDate', range.fromDate);
                     if (range.toDate) params.append('toDate', range.toDate);
                     
-                    const response = await fetch(`/api/smartlock/log?${params}`, { cache: 'no-cache' });
+                    // Ensure authorization header is included
+                    const token = localStorage.getItem('authToken');
+                    const fetchOptions = { 
+                        cache: 'no-cache',
+                        headers: {}
+                    };
+                    if (token) {
+                        fetchOptions.headers['Authorization'] = `Bearer ${token}`;
+                    }
+                    
+                    const response = await fetch(`/api/smartlock/log?${params}`, fetchOptions);
                     if (response.ok) {
                         const logs = await response.json();
                         if (logs.length > 0) {

@@ -40,6 +40,15 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Log collection disabled")
     
+    # Enforce log limits on startup (NEW)
+    enforce_limits_enabled = os.getenv("ENFORCE_LOG_LIMITS_ON_STARTUP", "true").lower() == "true"
+    if enforce_limits_enabled:
+        logger.info("Enforcing log limits on startup...")
+        cleaned_count = mqtt_client.log_manager.enforce_log_limits_on_startup()
+        logger.info(f"Startup log limit enforcement completed: {cleaned_count} old logs removed")
+    else:
+        logger.info("Startup log limit enforcement disabled")
+    
     # Cleanup existing duplicates on startup
     cleanup_enabled = os.getenv("CLEANUP_DUPLICATES_ON_STARTUP", "true").lower() == "true"
     if cleanup_enabled:
@@ -573,10 +582,10 @@ def delete_smartlock_auth(auth_ids: list[str]):
     return response
 
 @app.get("/smartlock/log")
-def get_all_smartlock_logs(limit: int = 50, fromDate: str = None, toDate: str = None, id: str = None):
+def get_all_smartlock_logs(limit: int = 10000, fromDate: str = None, toDate: str = None, id: str = None):
     """Get logs from all smartlocks - reads from persistent storage"""
     # Use LogManager to get logs from disk instead of memory
-    logs = mqtt_client.log_manager.get_logs(smartlock_id=None, limit=min(limit, 50))
+    logs = mqtt_client.log_manager.get_logs(smartlock_id=None, limit=limit)
     
     # Apply filters if provided
     if fromDate:
@@ -600,10 +609,10 @@ def get_all_smartlock_logs(limit: int = 50, fromDate: str = None, toDate: str = 
     return logs
 
 @app.get("/smartlock/{smartlock_id}/log")
-def get_smartlock_logs(smartlock_id: int, limit: int = 50, fromDate: str = None, toDate: str = None, id: str = None):
+def get_smartlock_logs(smartlock_id: int, limit: int = 10000, fromDate: str = None, toDate: str = None, id: str = None):
     """Get logs for a specific smartlock - reads from persistent storage"""
     # Use LogManager to get logs from disk instead of memory
-    logs = mqtt_client.log_manager.get_logs(smartlock_id=smartlock_id, limit=min(limit, 50))
+    logs = mqtt_client.log_manager.get_logs(smartlock_id=smartlock_id, limit=limit)
     
     # Apply filters if provided
     if fromDate:

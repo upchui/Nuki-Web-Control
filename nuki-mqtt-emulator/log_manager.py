@@ -116,14 +116,17 @@ class LogManager:
         
         logger.debug(f"Added log entry for smartlock {smartlock_id}: {log_entry.get('action', 'unknown')}")
     
-    def get_logs(self, smartlock_id: Optional[int] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_logs(self, smartlock_id: Optional[int] = None, limit: int = 10000) -> List[Dict[str, Any]]:
         """Get logs from disk with optional filtering"""
+        # Apply reasonable upper limit to prevent memory issues
+        effective_limit = min(limit, 50000) if limit > 0 else 50000
+        
         if smartlock_id is not None:
             # Get logs for specific smartlock
             logs = self.load_logs_from_disk(smartlock_id)
             # Sort by date descending and limit
             logs = sorted(logs, key=lambda x: x.get('date', ''), reverse=True)
-            return logs[:limit]
+            return logs[:effective_limit]
         else:
             # Get logs from all smartlocks
             all_logs = []
@@ -143,7 +146,7 @@ class LogManager:
             
             # Sort all logs by date descending and limit
             all_logs = sorted(all_logs, key=lambda x: x.get('date', ''), reverse=True)
-            return all_logs[:limit]
+            return all_logs[:effective_limit]
     
     def get_all_smartlock_ids(self) -> List[int]:
         """Get all smartlock IDs that have log files"""
@@ -171,6 +174,39 @@ class LogManager:
             if len(logs) > self.max_logs_per_smartlock:
                 logger.info(f"Cleaning up old logs for smartlock {smartlock_id}: {len(logs)} -> {self.max_logs_per_smartlock}")
                 self.save_logs_to_disk(smartlock_id, logs)
+    
+    def enforce_log_limits_on_startup(self):
+        """Enforce log limits on all existing log files during startup"""
+        smartlock_ids = self.get_all_smartlock_ids()
+        total_cleaned = 0
+        
+        logger.info(f"Enforcing log limits on startup (max: {self.max_logs_per_smartlock} per smartlock)")
+        
+        for smartlock_id in smartlock_ids:
+            logs = self.load_logs_from_disk(smartlock_id)
+            original_count = len(logs)
+            
+            if original_count > self.max_logs_per_smartlock:
+                # Sort by date descending and keep only the most recent logs
+                logs = sorted(logs, key=lambda x: x.get('date', ''), reverse=True)
+                logs = logs[:self.max_logs_per_smartlock]
+                
+                # Save the truncated logs back to disk
+                self.save_logs_to_disk(smartlock_id, logs)
+                
+                cleaned_count = original_count - len(logs)
+                total_cleaned += cleaned_count
+                
+                logger.info(f"Enforced limit for smartlock {smartlock_id}: {original_count} -> {len(logs)} logs (removed {cleaned_count})")
+            else:
+                logger.debug(f"Smartlock {smartlock_id}: {original_count} logs (within limit)")
+        
+        if total_cleaned > 0:
+            logger.info(f"Startup log limit enforcement completed: {total_cleaned} old logs removed across all smartlocks")
+        else:
+            logger.info("Startup log limit enforcement completed: all log files already within limits")
+        
+        return total_cleaned
     
     def remove_duplicate_logs(self, smartlock_id: Optional[int] = None):
         """Remove duplicate logs from existing log files"""
@@ -312,7 +348,7 @@ class LogCollector:
                     continue
                 
                 # Get logs from MQTT data store (in-memory)
-                mqtt_logs = self.mqtt_client.data_store.get_logs(smartlock_id=smartlock_id, limit=1000)
+                mqtt_logs = self.mqtt_client.data_store.get_logs(smartlock_id=smartlock_id, limit=10000)
                 
                 if not mqtt_logs:
                     continue

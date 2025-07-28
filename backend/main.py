@@ -828,9 +828,9 @@ def get_smartlocks_battery_status():
     return battery_info
 
 @app.get("/smartlock/log")
-def get_all_smartlock_logs(limit: int = 50, fromDate: str = None, toDate: str = None, id: str = None, current_user = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_all_smartlock_logs(limit: int = 10000, fromDate: str = None, toDate: str = None, id: str = None, current_user = Depends(get_current_user), db: Session = Depends(get_db)):
     """Get logs from all smartlocks"""
-    params = {"limit": min(limit, 50)}  # Ensure we don't exceed API limit
+    params = {"limit": min(limit, 10000)}  # Allow much higher limits for comprehensive log retrieval
     if fromDate:
         params["fromDate"] = fromDate
     if toDate:
@@ -863,7 +863,7 @@ def get_all_smartlock_logs(limit: int = 50, fromDate: str = None, toDate: str = 
 
 
 @app.get("/smartlock/{smartlock_id}/log")
-def get_smartlock_logs(smartlock_id: int, limit: int = 50, fromDate: str = None, toDate: str = None, id: str = None, current_user = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_smartlock_logs(smartlock_id: int, limit: int = 10000, fromDate: str = None, toDate: str = None, id: str = None, current_user = Depends(get_current_user), db: Session = Depends(get_db)):
     """Get logs for a specific smartlock"""
     # Check permissions for database users
     if isinstance(current_user, User):
@@ -873,7 +873,7 @@ def get_smartlock_logs(smartlock_id: int, limit: int = 50, fromDate: str = None,
                 detail="You don't have permission to view logs for this smartlock"
             )
     
-    params = {"limit": min(limit, 50)}  # Ensure we don't exceed API limit
+    params = {"limit": min(limit, 10000)}  # Allow much higher limits for comprehensive log retrieval
     if fromDate:
         params["fromDate"] = fromDate
     if toDate:
