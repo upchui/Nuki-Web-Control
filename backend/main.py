@@ -551,7 +551,7 @@ def unlatch_smartlock(smartlock_id: int, current_user: User = Depends(get_curren
     logging.info(f"Unlatching smartlock {smartlock_id}")
     url = f"{NUKI_API_URL}/smartlock/{smartlock_id}/action"
     logging.info(f"Calling Nuki API URL: {url}")
-    data = {"action": 3}
+    data = {"action": 1}
     response = requests.post(url, headers=headers, json=data)
     logging.info(f"Nuki API response status code: {response.status_code}")
     logging.info(f"Nuki API response text: {response.text}")

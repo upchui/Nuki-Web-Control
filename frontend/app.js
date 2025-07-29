@@ -430,7 +430,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 <td data-label="Battery">${batteryHtml}</td>
                 <td data-label="Actions" class="actions">
                     <button>Lock</button>
-                    <button>Unlatch</button>
+                    <button>Unlock</button>
                     <button>Sync</button>
                 </td>
             `;
@@ -1128,11 +1128,11 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const response = await fetch(`/api/smartlocks/${smartlockId}/action/unlatch`, { method: 'POST' });
             if (!response.ok) throw new Error('Failed to send unlatch command');
-            alert('Unlatch command sent');
+            alert('Unlock command sent');
             await refreshAllData();
         } catch (error) {
             console.error(error);
-            alert('Error sending unlatch command');
+            alert('Error sending unlock command');
         }
     };
 

@@ -161,9 +161,9 @@ def unlatch_smartlock(smartlock_id: int):
         raise HTTPException(status_code=404, detail="Smartlock not found")
     
     # Publish unlatch action to MQTT
-    mqtt_client.publish_action(smartlock_id, "unlatch")
+    mqtt_client.publish_action(smartlock_id, "unlock")
     
-    return {"message": "Unlatch command sent"}
+    return {"message": "Unlock command sent"}
 
 @app.post("/smartlock/{smartlock_id}/action")
 def smartlock_action(smartlock_id: int, action_data: dict):
