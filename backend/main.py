@@ -100,6 +100,29 @@ last_known_states = {}
 auto_sync_task = None
 groups_initialized = False
 
+# Global variable for group action prevention (prevents duplicate consecutive actions)
+group_last_action = {}
+# Format: {group_id: "lock"/"unlock"}
+
+def should_skip_group_action(group_id: int, action: str) -> bool:
+    """Check if group action should be skipped due to being the same as last action"""
+    global group_last_action
+    
+    last_action = group_last_action.get(group_id)
+    
+    if last_action == action:
+        logging.info(f"🚫 Skipping duplicate group action '{action}' for group {group_id} (last action was also '{last_action}')")
+        return True
+    
+    return False
+
+def record_group_action(group_id: int, action: str):
+    """Record the current group action to prevent immediate duplicates"""
+    global group_last_action
+    
+    group_last_action[group_id] = action
+    logging.debug(f"📝 Recorded group action '{action}' for group {group_id}")
+
 async def initialize_group_states():
     """Initialize all groups by locking all open smartlocks before starting monitoring"""
     global groups_initialized
@@ -261,7 +284,7 @@ async def auto_sync_groups():
                                         logging.info(f"Syncing {len(other_smartlock_ids)} other smartlocks in group to {target_action}")
                                         
                                         # Execute action on other smartlocks
-                                        await sync_group_smartlocks(other_smartlock_ids, target_action)
+                                        await sync_group_smartlocks(other_smartlock_ids, target_action, group.id)
                     
                     # Update last known state
                     last_known_states[smartlock_id] = current_state
@@ -275,8 +298,16 @@ async def auto_sync_groups():
         # Wait 2 seconds before next check
         await asyncio.sleep(2)
 
-async def sync_group_smartlocks(smartlock_ids: list, action: str):
+async def sync_group_smartlocks(smartlock_ids: list, action: str, group_id: int = None):
     """Sync specific smartlocks to a target action and wait for completion"""
+    
+    # Check if this group action should be skipped due to being the same as last action
+    if group_id and should_skip_group_action(group_id, action):
+        return  # Skip this action silently
+    
+    # Record this group action immediately to prevent duplicates
+    if group_id:
+        record_group_action(group_id, action)
     
     # Define action endpoints and target states
     action_map = {
