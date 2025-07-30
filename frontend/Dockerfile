@@ -65,6 +65,7 @@ RUN npx html-minifier-terser login.html \
 
 # Copy other static files
 RUN cp *.ico dist/ 2>/dev/null || true
+RUN cp robots.txt dist/ 2>/dev/null || true
 
 # Stage 2: Serve the application
 FROM nginx:alpine
