@@ -20,6 +20,16 @@ document.addEventListener('DOMContentLoaded', () => {
     const permissionsForm = document.getElementById('permissions-form');
     const permissionsModalTitle = document.getElementById('permissions-modal-title');
 
+    // Group UI Elements
+    const groupModal = document.getElementById('group-modal');
+    const groupForm = document.getElementById('group-form');
+    const groupModalTitle = document.getElementById('group-modal-title');
+    const addGroupButton = document.getElementById('add-group-button');
+    const groupNameInput = document.getElementById('group-name');
+    const groupDescriptionInput = document.getElementById('group-description');
+    const groupSmartlockSelect = document.getElementById('group-smartlock-select');
+    const groupIdInput = document.getElementById('group-id');
+
     // Logs UI Elements
     const logsContainer = document.getElementById('logs-container');
     const logsCount = document.getElementById('logs-count');
@@ -1582,9 +1592,13 @@ document.addEventListener('DOMContentLoaded', () => {
             // Save current page to localStorage (except for initial login)
             localStorage.setItem('currentPage', target);
             
-            // Load logs when logs page is accessed
+            // Load data when specific pages are accessed
             if (target === 'logs') {
                 fetchLogs();
+            } else if (target === 'admin') {
+                fetchUsers();
+            } else if (target === 'groups') {
+                fetchGroups();
             }
         }
     };
@@ -1750,11 +1764,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 
                 // Show admin menu if user is admin
                 if (data.is_admin) {
-                    const adminLink = document.querySelector('.admin-only');
-                    if (adminLink) {
-                        adminLink.style.display = 'flex';
-                        adminLink.classList.add('visible');
-                    }
+                    const adminLinks = document.querySelectorAll('.admin-only');
+                    adminLinks.forEach(link => {
+                        link.style.display = 'flex';
+                        link.classList.add('visible');
+                    });
                 }
                 
                 // Load user permissions for database users
@@ -1799,6 +1813,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- ADMIN FUNCTIONS ---
     
     let allUsers = [];
+    let allGroups = [];
     
     const fetchUsers = async () => {
         try {
@@ -1810,6 +1825,118 @@ document.addEventListener('DOMContentLoaded', () => {
             console.error('Error fetching users:', error);
             usersContainer.innerHTML = '<tr><td colspan="5">Error loading users</td></tr>';
         }
+    };
+
+    // --- GROUPS FUNCTIONS ---
+    
+    const fetchGroups = async () => {
+        try {
+            const response = await fetch('/api/admin/smartlock-groups');
+            if (!response.ok) throw new Error('Failed to fetch groups');
+            allGroups = await response.json();
+            renderGroups();
+        } catch (error) {
+            console.error('Error fetching groups:', error);
+            const groupsContainer = document.getElementById('groups-container');
+            if (groupsContainer) {
+                groupsContainer.innerHTML = '<tr><td colspan="5">Error loading groups</td></tr>';
+            }
+        }
+    };
+    
+    const renderGroups = () => {
+        const groupsContainer = document.getElementById('groups-container');
+        if (!groupsContainer) return;
+        
+        groupsContainer.innerHTML = '';
+        allGroups.forEach(group => {
+            const row = document.createElement('tr');
+            const createdDate = new Date(group.created_at).toLocaleDateString();
+            const smartlocksList = group.smartlock_names.join(', ');
+            
+            row.innerHTML = `
+                <td data-label="Name">${group.name}</td>
+                <td data-label="Description">${group.description || '-'}</td>
+                <td data-label="Smart Locks" title="${smartlocksList}">${smartlocksList}</td>
+                <td data-label="Created">${createdDate}</td>
+                <td data-label="Actions" class="group-actions">
+                    <button class="btn-info" onclick="editGroup(${group.id})">Edit</button>
+                    <button class="btn-danger" onclick="deleteGroup(${group.id})">Delete</button>
+                </td>
+            `;
+            groupsContainer.appendChild(row);
+        });
+    };
+
+    // Global functions for group actions
+
+    window.editGroup = (groupId) => {
+        const group = allGroups.find(g => g.id === groupId);
+        if (group) openGroupModal(group);
+    };
+
+    window.deleteGroup = async (groupId) => {
+        const group = allGroups.find(g => g.id === groupId);
+        if (!group) return;
+        
+        if (!confirm(`Are you sure you want to delete group "${group.name}"?`)) return;
+        
+        try {
+            const response = await fetch(`/api/admin/smartlock-groups/${groupId}`, { 
+                method: 'DELETE' 
+            });
+            
+            if (!response.ok) throw new Error('Failed to delete group');
+            
+            alert('Group deleted successfully');
+            fetchGroups();
+        } catch (error) {
+            console.error('Error deleting group:', error);
+            alert('Error deleting group');
+        }
+    };
+
+    const openGroupModal = (group = null) => {
+        groupForm.reset();
+        
+        if (group) {
+            groupModalTitle.textContent = 'Edit Group';
+            groupIdInput.value = group.id;
+            groupNameInput.value = group.name;
+            groupDescriptionInput.value = group.description || '';
+            populateGroupSmartlockSelect(group.smartlock_ids || []);
+        } else {
+            groupModalTitle.textContent = 'Create Group';
+            groupIdInput.value = '';
+            groupNameInput.value = '';
+            groupDescriptionInput.value = '';
+            populateGroupSmartlockSelect([]);
+        }
+        
+        groupModal.style.display = 'block';
+    };
+
+    const populateGroupSmartlockSelect = (selectedSmartlockIds = []) => {
+        groupSmartlockSelect.innerHTML = '';
+        
+        if (allSmartlocks.length === 0) {
+            groupSmartlockSelect.innerHTML = '<div class="no-smartlocks-warning">No smartlocks available.</div>';
+            return;
+        }
+        
+        const htmlParts = [];
+        allSmartlocks.forEach(smartlock => {
+            const isChecked = selectedSmartlockIds.includes(smartlock.smartlockId);
+            
+            htmlParts.push(`
+                <label>
+                    <input type="checkbox" value="${smartlock.smartlockId}" ${isChecked ? 'checked' : ''}>
+                    ${smartlock.name}
+                </label>
+            `);
+        });
+        
+        groupSmartlockSelect.innerHTML = htmlParts.join('');
     };
     
     const renderUsers = () => {
@@ -2054,6 +2181,58 @@ document.addEventListener('DOMContentLoaded', () => {
         addUserButton.addEventListener('click', () => openUserModal());
     }
     
+    // Event listeners for group functionality
+    if (addGroupButton) {
+        addGroupButton.addEventListener('click', () => openGroupModal());
+    }
+    
+    if (groupForm) {
+        groupForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const groupId = groupIdInput.value;
+            const name = groupNameInput.value;
+            const description = groupDescriptionInput.value;
+            
+            const selectedSmartlockIds = Array.from(groupSmartlockSelect.querySelectorAll('input:checked')).map(input => parseInt(input.value));
+            
+            if (selectedSmartlockIds.length === 0) {
+                alert('Please select at least one smart lock.');
+                return;
+            }
+            
+            const isEdit = !!groupId;
+            const url = isEdit ? `/api/admin/smartlock-groups/${groupId}` : '/api/admin/smartlock-groups';
+            const method = isEdit ? 'PUT' : 'POST';
+            
+            const payload = { 
+                name, 
+                description: description || null, 
+                smartlock_ids: selectedSmartlockIds 
+            };
+            
+            try {
+                const response = await fetch(url, {
+                    method,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Failed to save group');
+                }
+                
+                alert(`Group ${isEdit ? 'updated' : 'created'} successfully`);
+                groupModal.style.display = 'none';
+                fetchGroups();
+            } catch (error) {
+                console.error('Error saving group:', error);
+                alert(`Error saving group: ${error.message}`);
+            }
+        });
+    }
+    
     if (userForm) {
         userForm.addEventListener('submit', async (e) => {
             e.preventDefault();
@@ -2193,6 +2372,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (event.target === authModal) closeModal(authModal);
         if (event.target === userModal) userModal.style.display = 'none';
         if (event.target === permissionsModal) permissionsModal.style.display = 'none';
+        if (event.target === groupModal) groupModal.style.display = 'none';
     };
     
     // Load admin data when admin page is accessed
@@ -2201,6 +2381,38 @@ document.addEventListener('DOMContentLoaded', () => {
         originalSwitchToPage(target);
         if (target === 'admin') {
             fetchUsers();
+        } else if (target === 'groups') {
+            fetchGroups();
+        }
+    };
+    
+    // Update the Groups button access check
+    const checkAdminAccess = () => {
+        const token = localStorage.getItem('authToken');
+        if (token) {
+            fetch('/api/verify-token', {
+                headers: {
+                    'Authorization': `Bearer ${token}`
+                }
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data && data.is_admin) {
+                    // Show all admin navigation
+                    const adminLinks = document.querySelectorAll('.admin-only');
+                    adminLinks.forEach(link => {
+                        link.style.display = 'flex';
+                        link.classList.add('visible');
+                    });
+                    
+                    // Load admin data
+                    fetchUsers();
+                    fetchGroups();
+                }
+            })
+            .catch(error => {
+                console.error('Error checking admin status:', error);
+            });
         }
     };
 
