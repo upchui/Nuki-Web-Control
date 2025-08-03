@@ -7,7 +7,7 @@ from datetime import datetime
 import bcrypt
 
 # Current database schema version
-CURRENT_DB_VERSION = 2
+CURRENT_DB_VERSION = 3
 
 # Database setup
 DATABASE_URL = "sqlite:///./data/nuki_users.db"
@@ -64,6 +64,28 @@ class UserSpecificAuthAccess(Base):
     
     # Relationships
     user = relationship("User", back_populates="specific_auth_access")
+
+class SmartlockGroup(Base):
+    __tablename__ = "smartlock_groups"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    creator = relationship("User")
+    members = relationship("SmartlockGroupMember", back_populates="group", cascade="all, delete-orphan")
+
+class SmartlockGroupMember(Base):
+    __tablename__ = "smartlock_group_members"
+    
+    group_id = Column(Integer, ForeignKey("smartlock_groups.id"), primary_key=True)
+    smartlock_id = Column(Integer, primary_key=True)
+    
+    # Relationships
+    group = relationship("SmartlockGroup", back_populates="members")
 
 class DatabaseVersion(Base):
     __tablename__ = "database_version"
@@ -238,6 +260,22 @@ def apply_migrations(db: Session, current_version: int):
         db.commit()
         
         print("✅ Migration to version 2 completed")
+    
+    if current_version < 3:
+        print("Applying migration to version 3: Add smartlock groups tables")
+        
+        # The new tables will be automatically created by init_database()
+        # since we call Base.metadata.create_all(bind=engine) which creates all tables
+        
+        # Record this migration
+        version_record = DatabaseVersion(
+            version=3,
+            description="Add smartlock groups and group members tables"
+        )
+        db.add(version_record)
+        db.commit()
+        
+        print("✅ Migration to version 3 completed")
 
 def get_auth_permissions(db: Session, auth_id: str):
     """Get all user permissions for a specific authorization"""

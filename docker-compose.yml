@@ -13,8 +13,20 @@ services:
     networks:
       - nuki-network
 
+  nuki-mqtt-emulator:
+    build: ./nuki-mqtt-emulator
+    env_file:
+      - ./nuki-mqtt-emulator/.env
+    volumes:
+      - ./data/emulator-logs:/data-emulator/logs
+    networks:
+      - nuki-network
+    # Uncomment the following lines if you want to expose the emulator directly
+    #ports:
+    #  - "8001:8001"
+
   nginx:
-    image: nginx:latest
+    image: fholzer/nginx-brotli:latest
     ports:
       - "8080:80"
     volumes:
@@ -22,6 +34,7 @@ services:
     depends_on:
       - backend
       - frontend
+      - nuki-mqtt-emulator
     networks:
       - nuki-network
 

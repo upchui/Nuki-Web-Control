@@ -1,6 +1,7 @@
 import os
 import logging
 import re
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -14,11 +15,12 @@ import hashlib
 from sqlalchemy.orm import Session
 
 # Import our new modules
-from database import get_db, setup_database, User, UserSmartlockPermission, UserAuthPermission, UserSpecificAuthAccess, hash_password, verify_password, get_auth_permissions, copy_auth_permissions
+from database import get_db, setup_database, User, UserSmartlockPermission, UserAuthPermission, UserSpecificAuthAccess, SmartlockGroup, SmartlockGroupMember, hash_password, verify_password, get_auth_permissions, copy_auth_permissions
 from models import (
     UserCreate, UserUpdate, UserResponse, UserWithPermissions, UserPermissions, 
     UserPermissionsUpdate, AdminStatusUpdate, CurrentUserInfo, SmartlockPermission,
-    AuthPermissions, SpecificAuthAccess
+    AuthPermissions, SpecificAuthAccess, SmartlockGroupCreate, SmartlockGroupUpdate, 
+    SmartlockGroupResponse, SmartlockGroupActionResponse
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -93,12 +95,351 @@ def clean_log_data(logs):
     
     return cleaned_logs
 
+# Global variables for auto-sync
+last_known_states = {}
+auto_sync_task = None
+groups_initialized = False
+
+# Global variable for group action prevention (prevents duplicate consecutive actions)
+group_last_action = {}
+# Format: {group_id: "lock"/"unlock"}
+
+def should_skip_group_action(group_id: int, action: str) -> bool:
+    """Check if group action should be skipped due to being the same as last action"""
+    global group_last_action
+    
+    last_action = group_last_action.get(group_id)
+    
+    if last_action == action:
+        logging.info(f"🚫 Skipping duplicate group action '{action}' for group {group_id} (last action was also '{last_action}')")
+        return True
+    
+    return False
+
+def record_group_action(group_id: int, action: str):
+    """Record the current group action to prevent immediate duplicates"""
+    global group_last_action
+    
+    group_last_action[group_id] = action
+    logging.debug(f"📝 Recorded group action '{action}' for group {group_id}")
+
+async def initialize_group_states():
+    """Initialize all groups by locking all open smartlocks before starting monitoring"""
+    global groups_initialized
+    
+    logging.info("🔒 Starting group initialization - locking all open smartlocks in groups...")
+    
+    try:
+        # Get all smartlocks
+        response = requests.get(f"{NUKI_API_URL}/smartlock", headers=headers)
+        if response.status_code != 200:
+            logging.error(f"Failed to fetch smartlocks for initialization: {response.status_code}")
+            return False
+        
+        current_smartlocks = response.json()
+        smartlock_states = {sl.get('smartlockId'): sl.get('state', {}).get('state') for sl in current_smartlocks}
+        
+        db = next(get_db())
+        
+        try:
+            # Get all groups
+            groups = db.query(SmartlockGroup).all()
+            
+            if not groups:
+                logging.info("No groups found - skipping group initialization")
+                groups_initialized = True
+                return True
+            
+            logging.info(f"Found {len(groups)} groups to initialize")
+            
+            for group in groups:
+                group_smartlock_ids = [member.smartlock_id for member in group.members]
+                logging.info(f"Initializing group '{group.name}' with {len(group_smartlock_ids)} smartlocks")
+                
+                # Check states of all smartlocks in this group
+                open_smartlocks = []
+                locked_smartlocks = []
+                unknown_smartlocks = []
+                
+                for smartlock_id in group_smartlock_ids:
+                    state = smartlock_states.get(smartlock_id)
+                    if state == 1:  # locked
+                        locked_smartlocks.append(smartlock_id)
+                    elif state in [3, 5, 6]:  # unlocked, unlatched, unlocked (lock'n'go)
+                        open_smartlocks.append(smartlock_id)
+                    else:
+                        unknown_smartlocks.append(smartlock_id)
+                        logging.warning(f"Smartlock {smartlock_id} in group '{group.name}' has unknown state: {state}")
+                
+                logging.info(f"Group '{group.name}' status: {len(locked_smartlocks)} locked, {len(open_smartlocks)} open, {len(unknown_smartlocks)} unknown")
+                
+                # If there are open smartlocks, lock them all
+                if open_smartlocks:
+                    logging.info(f"🔒 Locking {len(open_smartlocks)} open smartlocks in group '{group.name}': {open_smartlocks}")
+                    await sync_group_smartlocks(open_smartlocks, "lock")
+                    
+                    # Wait for locks to be applied and verify
+                    logging.info(f"⏳ Waiting for locks to be applied in group '{group.name}'...")
+                    max_retries = 30  # 30 seconds
+                    retry_count = 0
+                    
+                    while retry_count < max_retries:
+                        await asyncio.sleep(1)
+                        retry_count += 1
+                        
+                        # Check if all smartlocks are now locked
+                        response = requests.get(f"{NUKI_API_URL}/smartlock", headers=headers)
+                        if response.status_code != 200:
+                            continue
+                        
+                        updated_smartlocks = response.json()
+                        updated_states = {sl.get('smartlockId'): sl.get('state', {}).get('state') for sl in updated_smartlocks}
+                        
+                        still_open = []
+                        for smartlock_id in open_smartlocks:
+                            if updated_states.get(smartlock_id) != 1:  # not locked
+                                still_open.append(smartlock_id)
+                        
+                        if not still_open:
+                            logging.info(f"✅ All smartlocks in group '{group.name}' are now locked")
+                            break
+                        else:
+                            logging.info(f"⏳ Still waiting for {len(still_open)} smartlocks to lock in group '{group.name}': {still_open}")
+                    
+                    if still_open:
+                        logging.warning(f"⚠️ Timeout waiting for some smartlocks to lock in group '{group.name}': {still_open}")
+                else:
+                    logging.info(f"✅ All smartlocks in group '{group.name}' are already locked")
+            
+            logging.info("🎉 Group initialization completed - all groups are synchronized")
+            groups_initialized = True
+            return True
+            
+        finally:
+            db.close()
+            
+    except Exception as e:
+        logging.error(f"❌ Error during group initialization: {e}")
+        groups_initialized = True  # Set to true to prevent blocking the app
+        return False
+
+async def auto_sync_groups():
+    """Background task to monitor smartlock status changes and auto-sync groups"""
+    global last_known_states, groups_initialized
+    
+    # First, initialize all groups by locking open smartlocks
+    if not groups_initialized:
+        await initialize_group_states()
+    
+    logging.info("🔄 Starting continuous group synchronization monitoring...")
+    
+    while True:
+        try:
+            # Get all smartlocks
+            response = requests.get(f"{NUKI_API_URL}/smartlock", headers=headers)
+            if response.status_code != 200:
+                logging.warning(f"Failed to fetch smartlocks for auto-sync: {response.status_code}")
+                await asyncio.sleep(5)
+                continue
+            
+            current_smartlocks = response.json()
+            db = next(get_db())
+            
+            try:
+                # Get all groups
+                groups = db.query(SmartlockGroup).all()
+                
+                for smartlock in current_smartlocks:
+                    smartlock_id = smartlock.get('smartlockId')
+                    current_state = smartlock.get('state', {}).get('state')
+                    
+                    # Skip if no state info
+                    if current_state is None:
+                        continue
+                    
+                    # Check if state changed
+                    last_state = last_known_states.get(smartlock_id)
+                    if last_state is not None and last_state != current_state:
+                        logging.info(f"Smartlock {smartlock_id} state changed from {last_state} to {current_state}")
+                        
+                        # Find groups containing this smartlock
+                        for group in groups:
+                            group_smartlock_ids = [member.smartlock_id for member in group.members]
+                            
+                            if smartlock_id in group_smartlock_ids:
+                                logging.info(f"Auto-syncing group '{group.name}' (ID: {group.id}) due to smartlock {smartlock_id} state change")
+                                
+                                # Determine target action based on new state
+                                target_action = None
+                                if current_state == 1:  # locked
+                                    target_action = "lock"
+                                elif current_state in [3, 5, 6]:  # unlocked, unlatched, unlocked (lock'n'go)
+                                    target_action = "unlock"
+                                
+                                if target_action:
+                                    # Sync other smartlocks in the group to the same state
+                                    other_smartlock_ids = [sid for sid in group_smartlock_ids if sid != smartlock_id]
+                                    
+                                    if other_smartlock_ids:
+                                        logging.info(f"Syncing {len(other_smartlock_ids)} other smartlocks in group to {target_action}")
+                                        
+                                        # Execute action on other smartlocks
+                                        await sync_group_smartlocks(other_smartlock_ids, target_action, group.id)
+                    
+                    # Update last known state
+                    last_known_states[smartlock_id] = current_state
+                
+            finally:
+                db.close()
+                
+        except Exception as e:
+            logging.error(f"Error in auto-sync groups: {e}")
+        
+        # Wait 2 seconds before next check
+        await asyncio.sleep(2)
+
+async def sync_group_smartlocks(smartlock_ids: list, action: str, group_id: int = None):
+    """Sync specific smartlocks to a target action and wait for completion"""
+    
+    # Check if this group action should be skipped due to being the same as last action
+    if group_id and should_skip_group_action(group_id, action):
+        return  # Skip this action silently
+    
+    # Record this group action immediately to prevent duplicates
+    if group_id:
+        record_group_action(group_id, action)
+    
+    # Define action endpoints and target states
+    action_map = {
+        "lock": "lock",
+        "unlock": "unlatch"
+    }
+    
+    # Define target states for verification
+    target_states = {
+        "lock": [1],  # locked
+        "unlock": [3, 5, 6]  # unlocked, unlatched, unlocked (lock'n'go)
+    }
+    
+    if action not in action_map:
+        logging.warning(f"Unknown action for group sync: {action}")
+        return
+    
+    endpoint_action = action_map[action]
+    target_state_list = target_states[action]
+    
+    def execute_single_sync_action(smartlock_id):
+        try:
+            if endpoint_action == "unlatch":
+                # Use the general action endpoint with action=1 for unlatch
+                url = f"{NUKI_API_URL}/smartlock/{smartlock_id}/action"
+                payload = {"action": 1}
+                response = requests.post(url, headers=headers, json=payload)
+                if response.status_code in [200, 204]:
+                    logging.info(f"Successfully sent {action} command to smartlock {smartlock_id}")
+                    return True
+                else:
+                    logging.warning(f"Failed to send {action} command to smartlock {smartlock_id}: HTTP {response.status_code}: {response.text}")
+                    return False
+            else:
+                # Use specific endpoint for lock
+                url = f"{NUKI_API_URL}/smartlock/{smartlock_id}/action/{endpoint_action}"
+                response = requests.post(url, headers=headers)
+                if response.status_code in [200, 204]:
+                    logging.info(f"Successfully sent {action} command to smartlock {smartlock_id}")
+                    return True
+                else:
+                    logging.warning(f"Failed to send {action} command to smartlock {smartlock_id}: HTTP {response.status_code}: {response.text}")
+                    return False
+        except Exception as e:
+            logging.error(f"Exception sending {action} command to smartlock {smartlock_id}: {e}")
+            return False
+    
+    # Step 1: Execute actions sequentially
+    successful_commands = []
+    failed_commands = []
+    
+    for smartlock_id in smartlock_ids:
+        if execute_single_sync_action(smartlock_id):
+            successful_commands.append(smartlock_id)
+        else:
+            failed_commands.append(smartlock_id)
+    
+    logging.info(f"Commands sent: {len(successful_commands)}/{len(smartlock_ids)} successful, {len(failed_commands)} failed")
+    
+    # Step 2: Wait for all smartlocks to reach target state
+    if successful_commands:
+        logging.info(f"⏳ Waiting for {len(successful_commands)} smartlocks to reach target state for action '{action}'...")
+        max_retries = 30  # 30 seconds
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            await asyncio.sleep(1)
+            retry_count += 1
+            
+            try:
+                # Check current states of all smartlocks
+                response = requests.get(f"{NUKI_API_URL}/smartlock", headers=headers)
+                if response.status_code != 200:
+                    logging.warning(f"Failed to fetch smartlock states for verification: {response.status_code}")
+                    continue
+                
+                current_smartlocks = response.json()
+                current_states = {sl.get('smartlockId'): sl.get('state', {}).get('state') for sl in current_smartlocks}
+                
+                # Check which smartlocks still need to reach target state
+                pending_smartlocks = []
+                completed_smartlocks = []
+                
+                for smartlock_id in successful_commands:
+                    current_state = current_states.get(smartlock_id)
+                    if current_state in target_state_list:
+                        completed_smartlocks.append(smartlock_id)
+                    else:
+                        pending_smartlocks.append(smartlock_id)
+                        logging.debug(f"Smartlock {smartlock_id} still has state {current_state}, waiting for {target_state_list}")
+                
+                if not pending_smartlocks:
+                    logging.info(f"✅ All {len(successful_commands)} smartlocks have reached target state for action '{action}'")
+                    break
+                else:
+                    logging.info(f"⏳ Still waiting for {len(pending_smartlocks)} smartlocks to reach target state: {pending_smartlocks}")
+                    
+            except Exception as e:
+                logging.warning(f"Error during state verification: {e}")
+                continue
+        
+        # Check if timeout occurred
+        if pending_smartlocks:
+            logging.warning(f"⚠️ Timeout waiting for {len(pending_smartlocks)} smartlocks to reach target state: {pending_smartlocks}")
+        
+        # Final status report
+        final_successful = len(successful_commands) - len(pending_smartlocks) if 'pending_smartlocks' in locals() else len(successful_commands)
+        logging.info(f"🎯 Group sync '{action}' completed: {final_successful}/{len(smartlock_ids)} smartlocks successfully synchronized")
+    else:
+        logging.warning(f"❌ No commands were sent successfully - group sync '{action}' failed")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global auto_sync_task
+    
     # Startup
     setup_database()
+    
+    # Start auto-sync background task
+    auto_sync_task = asyncio.create_task(auto_sync_groups())
+    logging.info("Started automatic group synchronization")
+    
     yield
-    # Shutdown (if needed in the future)
+    
+    # Shutdown
+    if auto_sync_task:
+        auto_sync_task.cancel()
+        try:
+            await auto_sync_task
+        except asyncio.CancelledError:
+            pass
+        logging.info("Stopped automatic group synchronization")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -111,12 +452,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-NUKI_API_URL = "https://api.nuki.io"
+NUKI_API_URL = os.getenv("NUKI_API_URL", "https://api.nuki.io")
 API_TOKEN = os.getenv("NUKI_API_TOKEN")
 JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-change-this")
 
 if not API_TOKEN:
     raise RuntimeError("NUKI_API_TOKEN environment variable not set")
+
+# Log which API we're using
+logging.info(f"Using Nuki API at: {NUKI_API_URL}")
 
 headers = {
     "Authorization": f"Bearer {API_TOKEN}",
@@ -548,7 +892,7 @@ def unlatch_smartlock(smartlock_id: int, current_user: User = Depends(get_curren
     logging.info(f"Unlatching smartlock {smartlock_id}")
     url = f"{NUKI_API_URL}/smartlock/{smartlock_id}/action"
     logging.info(f"Calling Nuki API URL: {url}")
-    data = {"action": 3}
+    data = {"action": 1}
     response = requests.post(url, headers=headers, json=data)
     logging.info(f"Nuki API response status code: {response.status_code}")
     logging.info(f"Nuki API response text: {response.text}")
@@ -825,9 +1169,9 @@ def get_smartlocks_battery_status():
     return battery_info
 
 @app.get("/smartlock/log")
-def get_all_smartlock_logs(limit: int = 50, fromDate: str = None, toDate: str = None, id: str = None, current_user = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_all_smartlock_logs(limit: int = 10000, fromDate: str = None, toDate: str = None, id: str = None, current_user = Depends(get_current_user), db: Session = Depends(get_db)):
     """Get logs from all smartlocks"""
-    params = {"limit": min(limit, 50)}  # Ensure we don't exceed API limit
+    params = {"limit": min(limit, 10000)}  # Allow much higher limits for comprehensive log retrieval
     if fromDate:
         params["fromDate"] = fromDate
     if toDate:
@@ -860,7 +1204,7 @@ def get_all_smartlock_logs(limit: int = 50, fromDate: str = None, toDate: str = 
 
 
 @app.get("/smartlock/{smartlock_id}/log")
-def get_smartlock_logs(smartlock_id: int, limit: int = 50, fromDate: str = None, toDate: str = None, id: str = None, current_user = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_smartlock_logs(smartlock_id: int, limit: int = 10000, fromDate: str = None, toDate: str = None, id: str = None, current_user = Depends(get_current_user), db: Session = Depends(get_db)):
     """Get logs for a specific smartlock"""
     # Check permissions for database users
     if isinstance(current_user, User):
@@ -870,7 +1214,7 @@ def get_smartlock_logs(smartlock_id: int, limit: int = 50, fromDate: str = None,
                 detail="You don't have permission to view logs for this smartlock"
             )
     
-    params = {"limit": min(limit, 50)}  # Ensure we don't exceed API limit
+    params = {"limit": min(limit, 10000)}  # Allow much higher limits for comprehensive log retrieval
     if fromDate:
         params["fromDate"] = fromDate
     if toDate:
@@ -1165,6 +1509,223 @@ def copy_auth_permissions_endpoint(
     
     copied_count = copy_auth_permissions(db, old_auth_id, new_auth_id)
     return {"message": f"Permissions copied successfully ({copied_count} permissions copied)"}
+
+# Smart Lock Groups Endpoints
+
+def check_group_permission(group: SmartlockGroup, current_user: User, db: Session):
+    """Check if user has permission to use a group (must have access to at least one smartlock in group)"""
+    if current_user.is_admin:
+        return True
+    
+    # User must have permission to at least one smartlock in the group
+    for member in group.members:
+        if check_smartlock_permission(member.smartlock_id, current_user, db):
+            return True
+    
+    return False
+
+@app.get("/admin/smartlock-groups", response_model=List[SmartlockGroupResponse])
+def get_all_groups(admin_user: User = Depends(require_admin), db: Session = Depends(get_db)):
+    """Get all smartlock groups (admin only)"""
+    groups = db.query(SmartlockGroup).all()
+    
+    # Get smartlock names for each group
+    smartlocks_response = requests.get(f"{NUKI_API_URL}/smartlock", headers=headers)
+    if smartlocks_response.status_code != 200:
+        raise HTTPException(status_code=smartlocks_response.status_code, detail="Failed to fetch smartlocks")
+    
+    all_smartlocks = smartlocks_response.json()
+    smartlock_map = {sl['smartlockId']: sl['name'] for sl in all_smartlocks}
+    
+    result = []
+    for group in groups:
+        smartlock_ids = [member.smartlock_id for member in group.members]
+        smartlock_names = [smartlock_map.get(sl_id, f"Unknown ({sl_id})") for sl_id in smartlock_ids]
+        
+        result.append(SmartlockGroupResponse(
+            id=group.id,
+            name=group.name,
+            description=group.description,
+            created_by=group.created_by,
+            created_at=group.created_at,
+            smartlock_ids=smartlock_ids,
+            smartlock_names=smartlock_names
+        ))
+    
+    return result
+
+@app.post("/admin/smartlock-groups", response_model=SmartlockGroupResponse)
+def create_group(group_data: SmartlockGroupCreate, admin_user: User = Depends(require_admin), db: Session = Depends(get_db)):
+    """Create a new smartlock group (admin only)"""
+    
+    # Validate smartlock IDs exist
+    smartlocks_response = requests.get(f"{NUKI_API_URL}/smartlock", headers=headers)
+    if smartlocks_response.status_code != 200:
+        raise HTTPException(status_code=smartlocks_response.status_code, detail="Failed to validate smartlocks")
+    
+    all_smartlocks = smartlocks_response.json()
+    valid_smartlock_ids = {sl['smartlockId'] for sl in all_smartlocks}
+    smartlock_map = {sl['smartlockId']: sl['name'] for sl in all_smartlocks}
+    
+    for smartlock_id in group_data.smartlock_ids:
+        if smartlock_id not in valid_smartlock_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid smartlock ID: {smartlock_id}"
+            )
+    
+    # Create new group
+    new_group = SmartlockGroup(
+        name=group_data.name,
+        description=group_data.description,
+        created_by=admin_user.id,
+        created_at=datetime.utcnow()
+    )
+    
+    db.add(new_group)
+    db.commit()
+    db.refresh(new_group)
+    
+    # Add group members
+    for smartlock_id in group_data.smartlock_ids:
+        member = SmartlockGroupMember(
+            group_id=new_group.id,
+            smartlock_id=smartlock_id
+        )
+        db.add(member)
+    
+    db.commit()
+    db.refresh(new_group)
+    
+    # Prepare response
+    smartlock_names = [smartlock_map.get(sl_id, f"Unknown ({sl_id})") for sl_id in group_data.smartlock_ids]
+    
+    return SmartlockGroupResponse(
+        id=new_group.id,
+        name=new_group.name,
+        description=new_group.description,
+        created_by=new_group.created_by,
+        created_at=new_group.created_at,
+        smartlock_ids=group_data.smartlock_ids,
+        smartlock_names=smartlock_names
+    )
+
+@app.put("/admin/smartlock-groups/{group_id}", response_model=SmartlockGroupResponse)
+def update_group(group_id: int, group_data: SmartlockGroupUpdate, admin_user: User = Depends(require_admin), db: Session = Depends(get_db)):
+    """Update a smartlock group (admin only)"""
+    
+    group = db.query(SmartlockGroup).filter(SmartlockGroup.id == group_id).first()
+    if not group:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Group not found"
+        )
+    
+    # Update group fields
+    if group_data.name is not None:
+        group.name = group_data.name
+    if group_data.description is not None:
+        group.description = group_data.description
+    
+    # Update smartlock members if provided
+    if group_data.smartlock_ids is not None:
+        # Validate smartlock IDs exist
+        smartlocks_response = requests.get(f"{NUKI_API_URL}/smartlock", headers=headers)
+        if smartlocks_response.status_code != 200:
+            raise HTTPException(status_code=smartlocks_response.status_code, detail="Failed to validate smartlocks")
+        
+        all_smartlocks = smartlocks_response.json()
+        valid_smartlock_ids = {sl['smartlockId'] for sl in all_smartlocks}
+        smartlock_map = {sl['smartlockId']: sl['name'] for sl in all_smartlocks}
+        
+        for smartlock_id in group_data.smartlock_ids:
+            if smartlock_id not in valid_smartlock_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid smartlock ID: {smartlock_id}"
+                )
+        
+        # Remove existing members
+        db.query(SmartlockGroupMember).filter(SmartlockGroupMember.group_id == group_id).delete()
+        
+        # Add new members
+        for smartlock_id in group_data.smartlock_ids:
+            member = SmartlockGroupMember(
+                group_id=group_id,
+                smartlock_id=smartlock_id
+            )
+            db.add(member)
+    
+    db.commit()
+    db.refresh(group)
+    
+    # Prepare response
+    smartlocks_response = requests.get(f"{NUKI_API_URL}/smartlock", headers=headers)
+    smartlock_map = {sl['smartlockId']: sl['name'] for sl in smartlocks_response.json()} if smartlocks_response.status_code == 200 else {}
+    
+    smartlock_ids = [member.smartlock_id for member in group.members]
+    smartlock_names = [smartlock_map.get(sl_id, f"Unknown ({sl_id})") for sl_id in smartlock_ids]
+    
+    return SmartlockGroupResponse(
+        id=group.id,
+        name=group.name,
+        description=group.description,
+        created_by=group.created_by,
+        created_at=group.created_at,
+        smartlock_ids=smartlock_ids,
+        smartlock_names=smartlock_names
+    )
+
+@app.delete("/admin/smartlock-groups/{group_id}")
+def delete_group(group_id: int, admin_user: User = Depends(require_admin), db: Session = Depends(get_db)):
+    """Delete a smartlock group (admin only)"""
+    
+    group = db.query(SmartlockGroup).filter(SmartlockGroup.id == group_id).first()
+    if not group:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Group not found"
+        )
+    
+    db.delete(group)
+    db.commit()
+    
+    return {"message": "Group deleted successfully"}
+
+@app.get("/smartlock-groups", response_model=List[SmartlockGroupResponse])
+def get_groups_for_user(current_user: User = Depends(get_current_db_user), db: Session = Depends(get_db)):
+    """Get smartlock groups that user has access to"""
+    groups = db.query(SmartlockGroup).all()
+    
+    # Get smartlock names
+    smartlocks_response = requests.get(f"{NUKI_API_URL}/smartlock", headers=headers)
+    if smartlocks_response.status_code != 200:
+        # Return empty list if can't fetch smartlocks
+        return []
+    
+    all_smartlocks = smartlocks_response.json()
+    smartlock_map = {sl['smartlockId']: sl['name'] for sl in all_smartlocks}
+    
+    # Filter groups based on permissions
+    accessible_groups = []
+    for group in groups:
+        if check_group_permission(group, current_user, db):
+            smartlock_ids = [member.smartlock_id for member in group.members]
+            smartlock_names = [smartlock_map.get(sl_id, f"Unknown ({sl_id})") for sl_id in smartlock_ids]
+            
+            accessible_groups.append(SmartlockGroupResponse(
+                id=group.id,
+                name=group.name,
+                description=group.description,
+                created_by=group.created_by,
+                created_at=group.created_at,
+                smartlock_ids=smartlock_ids,
+                smartlock_names=smartlock_names
+            ))
+    
+    return accessible_groups
+
+
 
 if __name__ == "__main__":
     import uvicorn

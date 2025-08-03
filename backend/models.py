@@ -68,3 +68,36 @@ class CurrentUserInfo(BaseModel):
     username: str
     is_admin: bool
     permissions: UserPermissions
+
+# Smart Lock Group Models
+class SmartlockGroupCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    smartlock_ids: List[int]
+
+class SmartlockGroupUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    smartlock_ids: Optional[List[int]] = None
+
+class SmartlockGroupResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    created_by: int
+    created_at: datetime
+    smartlock_ids: List[int]
+    smartlock_names: List[str]
+    
+    class Config:
+        from_attributes = True
+
+class SmartlockGroupActionResponse(BaseModel):
+    group_id: int
+    group_name: str
+    action: str
+    successful_smartlocks: List[int]
+    failed_smartlocks: List[dict]  # {"smartlock_id": int, "error": str}
+    total_smartlocks: int
+    success_count: int
+    failure_count: int

@@ -1262,6 +1262,98 @@ input:checked + .slider:before {
     margin: 0;
 }
 
+/* Group Management Styles */
+.group-actions {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+.group-actions button {
+    padding: 0.4rem 0.6rem;
+    font-size: 0.8rem;
+    min-height: 36px;
+    margin: 0;
+    border-radius: 4px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.group-actions .btn-success {
+    background-color: #28a745;
+    color: white;
+    border: none;
+}
+
+.group-actions .btn-success:hover {
+    background-color: #218838;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 4px rgba(40, 167, 69, 0.3);
+}
+
+.group-actions .btn-warning {
+    background-color: #ffc107;
+    color: #212529;
+    border: none;
+}
+
+.group-actions .btn-warning:hover {
+    background-color: #e0a800;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 4px rgba(255, 193, 7, 0.3);
+}
+
+.group-actions .btn-info {
+    background-color: #17a2b8;
+    color: white;
+    border: none;
+}
+
+.group-actions .btn-info:hover {
+    background-color: #138496;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 4px rgba(23, 162, 184, 0.3);
+}
+
+.group-actions .btn-danger {
+    background-color: #dc3545;
+    color: white;
+    border: none;
+}
+
+.group-actions .btn-danger:hover {
+    background-color: #c82333;
+    transform: translateY(-1px);
+    box-shadow: 0 2px 4px rgba(220, 53, 69, 0.3);
+}
+
+/* Group Modal Specific Styles */
+#group-modal .multi-select-container {
+    max-height: 200px;
+    overflow-y: auto;
+}
+
+#group-modal .form-group textarea {
+    resize: vertical;
+    min-height: 80px;
+}
+
+/* Groups Table Responsive Styles */
+@media (max-width: 767px) {
+    .group-actions {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0.25rem;
+    }
+    
+    .group-actions button {
+        width: 100%;
+        margin-bottom: 0.25rem;
+    }
+}
+
 /* Status Indicators */
 .status-indicator {
     display: inline-flex;

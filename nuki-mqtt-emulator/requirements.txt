@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+paho-mqtt
+sqlalchemy
+pydantic
+python-multipart

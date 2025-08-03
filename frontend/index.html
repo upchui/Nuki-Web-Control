@@ -14,10 +14,11 @@
             <a href="#" class="nav-link" data-target="authorizations">Authorizations</a>
             <a href="#" class="nav-link" data-target="logs">Logs</a>
             <a href="#" class="nav-link admin-only" data-target="admin" style="display: none;">Admin</a>
+            <a href="#" class="nav-link admin-only" data-target="groups" style="display: none;">Groups</a>
         </nav>
         <div class="user-info">
             <span id="username-display"></span>
-            <button id="logout-button" class="logout-btn">Abmelden</button>
+            <button id="logout-button" class="logout-btn">Log out</button>
         </div>
     </header>
 
@@ -195,6 +196,30 @@
             </div>
         </div>
 
+        <div id="groups" class="page-content">
+            <div class="container">
+                <div class="card">
+                    <h2>Smart Lock Groups</h2>
+                    <p class="feature-description">Use groups to control multiple locks at once. If you lock or unlock any single lock in a group, the entire group will lock or unlock together.</p>
+                    <button id="add-group-button">Create Group</button>
+                    <div class="table-container">
+                        <table id="groups-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Description</th>
+                                    <th>Smart Locks</th>
+                                    <th>Created</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="groups-container"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
     </main>
 
     <!-- Modals -->
@@ -335,6 +360,35 @@
 
                 <div class="form-actions">
                     <button type="submit" class="btn-primary">Save Permissions</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Group Management Modal -->
+    
+    <div id="group-modal" class="modal">
+        <div class="modal-content">
+            <span class="close-button">&times;</span>
+            <h3 id="group-modal-title">Create Group</h3>
+            <form id="group-form">
+                <input type="hidden" id="group-id">
+                <div class="form-group">
+                    <label for="group-name">Group Name:</label>
+                    <input type="text" id="group-name" required>
+                </div>
+                <div class="form-group">
+                    <label for="group-description">Description:</label>
+                    <textarea id="group-description" rows="3" placeholder="Optional description"></textarea>
+                </div>
+                <div class="form-group">
+                    <label>Smart Locks:</label>
+                    <div id="group-smartlock-select" class="multi-select-container">
+                        <!-- Smartlock options will be populated by JS -->
+                    </div>
+                </div>
+                <div class="form-actions">
+                    <button type="submit" class="btn-primary">Save Group</button>
                 </div>
             </form>
         </div>

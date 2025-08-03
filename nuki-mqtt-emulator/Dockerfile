@@ -18,11 +18,10 @@ COPY requirements.txt .
 RUN echo 'fastapi' > requirements_optimized.txt && \
     echo 'uvicorn[standard]' >> requirements_optimized.txt && \
     echo 'uvloop' >> requirements_optimized.txt && \
-    echo 'requests' >> requirements_optimized.txt && \
-    echo 'PyJWT==2.8.0' >> requirements_optimized.txt && \
-    echo 'python-multipart==0.0.6' >> requirements_optimized.txt && \
+    echo 'paho-mqtt' >> requirements_optimized.txt && \
     echo 'sqlalchemy' >> requirements_optimized.txt && \
-    echo 'bcrypt' >> requirements_optimized.txt
+    echo 'pydantic' >> requirements_optimized.txt && \
+    echo 'python-multipart' >> requirements_optimized.txt
 
 # Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
@@ -78,12 +77,12 @@ ENV PYTHONOPTIMIZE=2 \
 USER appuser
 
 # Expose port
-EXPOSE 8000
+EXPOSE 8001
 
 # Optimized uvicorn command with uvloop
 CMD ["uvicorn", "main:app", \
      "--host", "0.0.0.0", \
-     "--port", "8000", \
+     "--port", "8001", \
      "--loop", "uvloop", \
      "--workers", "1", \
      "--log-level", "info", \
