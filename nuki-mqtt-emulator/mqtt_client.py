@@ -201,7 +201,7 @@ class MQTTDataStore:
                     if weekdays and len(weekdays) > 0:
                         # Corrected weekday mapping to match expected output
                         weekday_map = {"mon": 64, "tue": 32, "wed": 16, "thu": 8, "fri": 4, "sat": 2, "sun": 1}
-                        weekday_bits = sum(weekday_map.get(day.lower(), 0) for day in weekdays)
+                        weekday_bits = sum(weekday_map.get(day.lower(), 0) for day in (weekdays or []))
                     
                     # Convert time to minutes - FIXED to return 0 for "00:00"
                     def convert_time_to_minutes(time_str):
@@ -336,7 +336,7 @@ class MQTTDataStore:
         weekday_bits = 0
         if weekdays and len(weekdays) > 0:
             weekday_map = {"mon": 64, "tue": 32, "wed": 16, "thu": 8, "fri": 4, "sat": 2, "sun": 1}
-            weekday_bits = sum(weekday_map.get(day.lower(), 0) for day in weekdays)
+            weekday_bits = sum(weekday_map.get(day.lower(), 0) for day in (weekdays or []))
         
         # Convert time to minutes
         def convert_time_to_minutes(time_str):
@@ -406,7 +406,7 @@ class MQTTDataStore:
         weekday_bits = 0
         if weekdays and len(weekdays) > 0:
             weekday_map = {"mon": 64, "tue": 32, "wed": 16, "thu": 8, "fri": 4, "sat": 2, "sun": 1}
-            weekday_bits = sum(weekday_map.get(day.lower(), 0) for day in weekdays)
+            weekday_bits = sum(weekday_map.get(day.lower(), 0) for day in (weekdays or []))
         
         # Convert time to minutes
         def convert_time_to_minutes(time_str):
@@ -964,9 +964,11 @@ class MQTTClient:
         # Subscribe to broad patterns to catch all possible Nuki topics
         wildcard_topics = [
             "+/+/action",
-            "+/+/state",
+            "+/+/state", 
             "+/+/json",
             "+/+/keypad/+",
+            "+/+/keypad/code_+",  # Individual keypad codes
+            "+/+/keypad/codes",   # All keypad codes JSON
             "+/+/timecontrol/+",
             "+/+/authorization/+",
             "+/+/configuration/+",
@@ -982,8 +984,11 @@ class MQTTClient:
         ]
         
         for topic in wildcard_topics:
-            self.client.subscribe(topic)
-            logger.info(f"Subscribed to wildcard topic: {topic}")
+            try:
+                self.client.subscribe(topic)
+                logger.info(f"Subscribed to wildcard topic: {topic}")
+            except Exception as e:
+                logger.error(f"Failed to subscribe to topic {topic}: {e}")
     
     def publish_initial_states(self):
         """Publish initial states for all smartlocks"""
@@ -1044,6 +1049,9 @@ class MQTTClient:
                         self.handle_keypad_action(smartlock_id, payload)
                     elif topic_parts[3] == "json":
                         self.handle_keypad_codes_update(smartlock_id, payload)
+                    elif topic_parts[3] == "codes" and len(topic_parts) > 4:
+                        # Handle individual keypad code entries: werkstatt/lock/keypad/codes/0
+                        self.handle_individual_keypad_code(smartlock_id, topic_parts[4], payload)
             elif action_type == "timecontrol":
                 if len(topic_parts) > 3:
                     if topic_parts[3] == "actionJson":
@@ -1097,6 +1105,15 @@ class MQTTClient:
         if "opener" in name.lower():
             logger.info(f"Ignoring opener device: {name}")
             return None
+        
+        # For the real MQTT system, map werkstatt to smartlock_id 1001
+        if topic_prefix == "werkstatt" and name == "lock":
+            smartlock_id = 1001
+            # Store the mappings
+            self.smartlock_topic_map[smartlock_id] = topic_prefix
+            self.device_name_map[smartlock_id] = f"{topic_prefix}_{name}"
+            logger.info(f"Mapped real MQTT device: {topic_prefix}/{name} -> ID {smartlock_id}")
+            return smartlock_id
         
         # Create unique topic key for this prefix/device combination
         topic_key = f"{topic_prefix}_{name}"
@@ -1399,6 +1416,42 @@ class MQTTClient:
         except Exception as e:
             logger.error(f"Error handling state update: {e}")
     
+    def handle_individual_keypad_code(self, smartlock_id: int, code_index: str, payload: str):
+        """Handle individual keypad code entries from MQTT"""
+        try:
+            code_data = json.loads(payload)
+            logger.info(f"Received individual keypad code {code_index} for smartlock {smartlock_id}: {payload}")
+            
+            # Initialize keypad codes list if not exists
+            with self.data_store.lock:
+                if smartlock_id not in self.data_store.keypad_codes:
+                    self.data_store.keypad_codes[smartlock_id] = []
+                
+                # Find existing code with this index or codeId and update it, or add new one
+                codes = self.data_store.keypad_codes[smartlock_id]
+                code_id = code_data.get("codeId")
+                
+                # Look for existing code to update
+                code_updated = False
+                for i, existing_code in enumerate(codes):
+                    if (existing_code.get("codeId") == code_id or 
+                        existing_code.get("index") == int(code_index) if code_index.isdigit() else False):
+                        # Update existing code
+                        codes[i] = code_data
+                        code_updated = True
+                        logger.info(f"Updated existing keypad code {code_id} at index {code_index}")
+                        break
+                
+                if not code_updated:
+                    # Add new code
+                    codes.append(code_data)
+                    logger.info(f"Added new keypad code {code_id} at index {code_index}")
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in individual keypad code update: {e}")
+        except Exception as e:
+            logger.error(f"Error handling individual keypad code update: {e}")
+
     def handle_keypad_codes_update(self, smartlock_id: int, payload: str):
         """Handle keypad codes updates from MQTT"""
         try:
