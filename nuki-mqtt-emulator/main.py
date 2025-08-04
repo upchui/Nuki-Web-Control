@@ -204,157 +204,241 @@ def get_smartlock_auths():
 
 @app.put("/smartlock/auth")
 def create_smartlock_auth(auth: SmartlockAuthCreate):
-    """Create a new smartlock authorization via MQTT (to fix time-limited access)"""
+    """Create a new smartlock authorization via MQTT (FIXED: sequential processing for multiple smartlocks)"""
     
     # Validate that smartlockIds is not empty
     if not auth.smartlockIds:
         raise HTTPException(status_code=400, detail="No smartlocks specified")
     
-    # Create authorization for each smartlock via MQTT (like the old working version)
+    import time
+    
+    # Create authorization for each smartlock SEQUENTIALLY to avoid Race Conditions
     created_auths = []
-    for smartlock_id in auth.smartlockIds:
-        # Check if smartlock exists
-        smartlock = mqtt_client.data_store.get_smartlock(smartlock_id)
-        if not smartlock:
-            logger.warning(f"Smartlock {smartlock_id} not found, creating it")
-            mqtt_client.data_store.create_smartlock(smartlock_id, mqtt_client)
-        
-        # For keypad codes (type 13), use MQTT keypad action (FIXED)
-        if auth.type == 13:
-            # Prepare MQTT keypad action data (like the old version)
-            mqtt_action_data = {
-                "action": "add",
-                "name": auth.name,
-                "code": auth.code,
-                "enabled": 1 if auth.enabled else 0
-            }
+    failed_creations = []
+    
+    logger.info(f"Creating authorization '{auth.name}' for {len(auth.smartlockIds)} smartlock(s): {auth.smartlockIds}")
+    
+    for i, smartlock_id in enumerate(auth.smartlockIds):
+        try:
+            logger.info(f"Processing smartlock {smartlock_id} ({i+1}/{len(auth.smartlockIds)})")
             
-            # Add time restrictions if present (FIXED LOGIC)
-            if any([auth.allowedFromDate, auth.allowedUntilDate, auth.allowedWeekDays, 
-                   auth.allowedFromTime, auth.allowedUntilTime]):
-                mqtt_action_data["timeLimited"] = 1
-                
-                if auth.allowedFromDate:
-                    # Convert from ISO format to MQTT format
-                    mqtt_action_data["allowedFrom"] = auth.allowedFromDate.replace("T", " ").replace(".000Z", "")
-                if auth.allowedUntilDate:
-                    mqtt_action_data["allowedUntil"] = auth.allowedUntilDate.replace("T", " ").replace(".000Z", "")
-                if auth.allowedWeekDays:
-                    # Convert bit representation to weekday names
-                    weekday_map = {64: "mon", 32: "tue", 16: "wed", 8: "thu", 4: "fri", 2: "sat", 1: "sun"}
-                    weekdays = []
-                    for bit, day in weekday_map.items():
-                        if auth.allowedWeekDays & bit:
-                            weekdays.append(day)
-                    mqtt_action_data["allowedWeekdays"] = weekdays
-                if auth.allowedFromTime is not None:
-                    # Convert minutes to HH:MM
-                    hours = auth.allowedFromTime // 60
-                    minutes = auth.allowedFromTime % 60
-                    mqtt_action_data["allowedFromTime"] = f"{hours:02d}:{minutes:02d}"
-                if auth.allowedUntilTime is not None:
-                    hours = auth.allowedUntilTime // 60
-                    minutes = auth.allowedUntilTime % 60
-                    mqtt_action_data["allowedUntilTime"] = f"{hours:02d}:{minutes:02d}"
-            else:
-                mqtt_action_data["timeLimited"] = 0
+            # Check if smartlock exists
+            smartlock = mqtt_client.data_store.get_smartlock(smartlock_id)
+            if not smartlock:
+                logger.warning(f"Smartlock {smartlock_id} not found, creating it")
+                mqtt_client.data_store.create_smartlock(smartlock_id, mqtt_client)
+                # Wait a bit for smartlock creation to settle
+                time.sleep(0.2)
             
-            # Send MQTT action - this will create the keypad code via MQTT handler
-            mqtt_client.publish_keypad_action(smartlock_id, mqtt_action_data)
-            
-            # Wait briefly for MQTT processing and then find the created auth
-            import time
-            time.sleep(0.1)  # 100ms wait for MQTT processing
-            
-            # Find the newly created authorization
-            new_auths = [a for a in mqtt_client.data_store.get_authorizations() 
-                        if a.get("smartlockId") == smartlock_id and 
-                           a.get("name") == auth.name and 
-                           a.get("code") == auth.code]
-            if new_auths:
-                created_auth = new_auths[-1]  # Take the most recent one
-                created_auths.append(created_auth)
-                logger.info(f"Created keypad code via MQTT for smartlock {smartlock_id}: {auth.name}")
-            else:
-                # Fallback: create a placeholder response
-                created_auth = {
-                    "id": "pending",
-                    "smartlockId": smartlock_id,
+            # For keypad codes (type 13), use MQTT keypad action
+            if auth.type == 13:
+                # Prepare MQTT keypad action data
+                mqtt_action_data = {
+                    "action": "add",
                     "name": auth.name,
                     "code": auth.code,
-                    "type": 13,
-                    "enabled": auth.enabled,
-                    "remoteAllowed": True,
-                    "lockCount": 0,
-                    "creationDate": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                    "enabled": 1 if auth.enabled else 0
                 }
-                created_auths.append(created_auth)
-                logger.warning(f"MQTT keypad creation pending for smartlock {smartlock_id}: {auth.name}")
-        
-        else:
-            # Create regular authorization via MQTT (like the old version)
-            mqtt_action_data = {
-                "action": "add",
-                "name": auth.name,
-                "type": auth.type,
-                "enabled": 1 if auth.enabled else 0,
-                "remoteAllowed": 1 if auth.remoteAllowed else 0
-            }
+                
+                # DEBUG: Check what Time-Limited fields we received
+                logger.info(f"DEBUG CREATE - Time-Limited fields received:")
+                logger.info(f"  allowedFromDate: {auth.allowedFromDate}")
+                logger.info(f"  allowedUntilDate: {auth.allowedUntilDate}")
+                logger.info(f"  allowedWeekDays: {auth.allowedWeekDays}")
+                logger.info(f"  allowedFromTime: {auth.allowedFromTime}")
+                logger.info(f"  allowedUntilTime: {auth.allowedUntilTime}")
+                
+                # FIXED: Check for Time-Limited fields properly (including None and empty string)
+                has_time_restrictions = any([
+                    auth.allowedFromDate and auth.allowedFromDate.strip(),
+                    auth.allowedUntilDate and auth.allowedUntilDate.strip(), 
+                    auth.allowedWeekDays and auth.allowedWeekDays > 0,
+                    auth.allowedFromTime is not None and auth.allowedFromTime >= 0,
+                    auth.allowedUntilTime is not None and auth.allowedUntilTime >= 0
+                ])
+                
+                logger.info(f"DEBUG CREATE - has_time_restrictions: {has_time_restrictions}")
+                
+                if has_time_restrictions:
+                    mqtt_action_data["timeLimited"] = 1
+                    logger.info(f"DEBUG CREATE - Setting timeLimited = 1")
+                    
+                    if auth.allowedFromDate and auth.allowedFromDate.strip():
+                        # Convert from ISO format to MQTT format
+                        mqtt_action_data["allowedFrom"] = auth.allowedFromDate.replace("T", " ").replace(".000Z", "")
+                        logger.info(f"DEBUG CREATE - Added allowedFrom: {mqtt_action_data['allowedFrom']}")
+                    
+                    if auth.allowedUntilDate and auth.allowedUntilDate.strip():
+                        mqtt_action_data["allowedUntil"] = auth.allowedUntilDate.replace("T", " ").replace(".000Z", "")
+                        logger.info(f"DEBUG CREATE - Added allowedUntil: {mqtt_action_data['allowedUntil']}")
+                    
+                    if auth.allowedWeekDays and auth.allowedWeekDays > 0:
+                        # Convert bit representation to weekday names
+                        weekday_map = {64: "mon", 32: "tue", 16: "wed", 8: "thu", 4: "fri", 2: "sat", 1: "sun"}
+                        weekdays = []
+                        for bit, day in weekday_map.items():
+                            if auth.allowedWeekDays & bit:
+                                weekdays.append(day)
+                        mqtt_action_data["allowedWeekdays"] = weekdays
+                        logger.info(f"DEBUG CREATE - Added allowedWeekdays: {weekdays}")
+                    
+                    if auth.allowedFromTime is not None and auth.allowedFromTime >= 0:
+                        # Convert minutes to HH:MM
+                        hours = auth.allowedFromTime // 60
+                        minutes = auth.allowedFromTime % 60
+                        mqtt_action_data["allowedFromTime"] = f"{hours:02d}:{minutes:02d}"
+                        logger.info(f"DEBUG CREATE - Added allowedFromTime: {mqtt_action_data['allowedFromTime']}")
+                    
+                    if auth.allowedUntilTime is not None and auth.allowedUntilTime >= 0:
+                        hours = auth.allowedUntilTime // 60
+                        minutes = auth.allowedUntilTime % 60
+                        mqtt_action_data["allowedUntilTime"] = f"{hours:02d}:{minutes:02d}"
+                        logger.info(f"DEBUG CREATE - Added allowedUntilTime: {mqtt_action_data['allowedUntilTime']}")
+                else:
+                    mqtt_action_data["timeLimited"] = 0
+                    logger.info(f"DEBUG CREATE - Setting timeLimited = 0 (no time restrictions found)")
+                
+                logger.info(f"Sending MQTT keypad action for smartlock {smartlock_id}: {mqtt_action_data}")
+                
+                # Send MQTT action - this will create the keypad code via MQTT handler
+                mqtt_client.publish_keypad_action(smartlock_id, mqtt_action_data)
+                
+                # Wait longer for MQTT processing to complete (FIXED: increased wait time)
+                time.sleep(0.5)  # 500ms wait for MQTT processing
+                
+                # Retry logic: try to find the created auth with multiple attempts
+                created_auth = None
+                for attempt in range(3):  # Try up to 3 times
+                    new_auths = [a for a in mqtt_client.data_store.get_authorizations() 
+                                if a.get("smartlockId") == smartlock_id and 
+                                   a.get("name") == auth.name and 
+                                   a.get("code") == auth.code]
+                    if new_auths:
+                        created_auth = new_auths[-1]  # Take the most recent one
+                        logger.info(f"✅ Successfully created keypad code for smartlock {smartlock_id}: {auth.name}")
+                        break
+                    else:
+                        logger.warning(f"Attempt {attempt+1}: Auth not found yet for smartlock {smartlock_id}, waiting...")
+                        time.sleep(0.3)  # Wait 300ms before retry
+                
+                if created_auth:
+                    created_auths.append(created_auth)
+                else:
+                    # Create a fallback response but mark as failed
+                    created_auth = {
+                        "id": "pending",
+                        "smartlockId": smartlock_id,
+                        "name": auth.name,
+                        "code": auth.code,
+                        "type": 13,
+                        "enabled": auth.enabled,
+                        "remoteAllowed": True,
+                        "lockCount": 0,
+                        "creationDate": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                    }
+                    failed_creations.append({
+                        "smartlockId": smartlock_id,
+                        "reason": "MQTT creation timeout - authorization may still be processing"
+                    })
+                    logger.error(f"❌ Failed to create keypad code for smartlock {smartlock_id}: timeout")
             
-            if auth.code:
-                mqtt_action_data["code"] = auth.code
-            if auth.accountUserId:
-                mqtt_action_data["accountUserId"] = auth.accountUserId
-            if auth.allowedFromDate:
-                mqtt_action_data["allowedFrom"] = auth.allowedFromDate
-            if auth.allowedUntilDate:
-                mqtt_action_data["allowedUntil"] = auth.allowedUntilDate
-            if auth.allowedWeekDays:
-                mqtt_action_data["allowedWeekdays"] = auth.allowedWeekDays
-            if auth.allowedFromTime:
-                mqtt_action_data["allowedFromTime"] = auth.allowedFromTime
-            if auth.allowedUntilTime:
-                mqtt_action_data["allowedUntilTime"] = auth.allowedUntilTime
-            
-            # Send MQTT action - this will create the authorization via MQTT handler
-            mqtt_client.publish_authorization_action(smartlock_id, mqtt_action_data)
-            
-            # Wait briefly for MQTT processing and then find the created auth
-            import time
-            time.sleep(0.1)  # 100ms wait for MQTT processing
-            
-            # Find the newly created authorization
-            new_auths = [a for a in mqtt_client.data_store.get_authorizations() 
-                        if a.get("smartlockId") == smartlock_id and 
-                           a.get("name") == auth.name and 
-                           a.get("type") == auth.type]
-            if new_auths:
-                created_auth = new_auths[-1]  # Take the most recent one
-                created_auths.append(created_auth)
-                logger.info(f"Created authorization via MQTT for smartlock {smartlock_id}: {auth.name}")
             else:
-                # Fallback: create a placeholder response
-                created_auth = {
-                    "id": "pending",
-                    "smartlockId": smartlock_id,
+                # Create regular authorization via MQTT
+                mqtt_action_data = {
+                    "action": "add",
                     "name": auth.name,
                     "type": auth.type,
-                    "enabled": auth.enabled,
-                    "remoteAllowed": auth.remoteAllowed if auth.remoteAllowed is not None else True,
-                    "lockCount": 0,
-                    "creationDate": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                    "enabled": 1 if auth.enabled else 0,
+                    "remoteAllowed": 1 if auth.remoteAllowed else 0
                 }
+                
                 if auth.code:
-                    created_auth["code"] = auth.code
-                created_auths.append(created_auth)
-                logger.warning(f"MQTT authorization creation pending for smartlock {smartlock_id}: {auth.name}")
+                    mqtt_action_data["code"] = auth.code
+                if auth.accountUserId:
+                    mqtt_action_data["accountUserId"] = auth.accountUserId
+                if auth.allowedFromDate:
+                    mqtt_action_data["allowedFrom"] = auth.allowedFromDate
+                if auth.allowedUntilDate:
+                    mqtt_action_data["allowedUntil"] = auth.allowedUntilDate
+                if auth.allowedWeekDays:
+                    mqtt_action_data["allowedWeekdays"] = auth.allowedWeekDays
+                if auth.allowedFromTime:
+                    mqtt_action_data["allowedFromTime"] = auth.allowedFromTime
+                if auth.allowedUntilTime:
+                    mqtt_action_data["allowedUntilTime"] = auth.allowedUntilTime
+                
+                logger.info(f"Sending MQTT authorization action for smartlock {smartlock_id}: {mqtt_action_data}")
+                
+                # Send MQTT action - this will create the authorization via MQTT handler
+                mqtt_client.publish_authorization_action(smartlock_id, mqtt_action_data)
+                
+                # Wait longer for MQTT processing
+                time.sleep(0.5)
+                
+                # Retry logic for regular authorizations
+                created_auth = None
+                for attempt in range(3):
+                    new_auths = [a for a in mqtt_client.data_store.get_authorizations() 
+                                if a.get("smartlockId") == smartlock_id and 
+                                   a.get("name") == auth.name and 
+                                   a.get("type") == auth.type]
+                    if new_auths:
+                        created_auth = new_auths[-1]  # Take the most recent one
+                        logger.info(f"✅ Successfully created authorization for smartlock {smartlock_id}: {auth.name}")
+                        break
+                    else:
+                        logger.warning(f"Attempt {attempt+1}: Auth not found yet for smartlock {smartlock_id}, waiting...")
+                        time.sleep(0.3)
+                
+                if created_auth:
+                    created_auths.append(created_auth)
+                else:
+                    # Create a fallback response but mark as failed
+                    created_auth = {
+                        "id": "pending",
+                        "smartlockId": smartlock_id,
+                        "name": auth.name,
+                        "type": auth.type,
+                        "enabled": auth.enabled,
+                        "remoteAllowed": auth.remoteAllowed if auth.remoteAllowed is not None else True,
+                        "lockCount": 0,
+                        "creationDate": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                    }
+                    if auth.code:
+                        created_auth["code"] = auth.code
+                    failed_creations.append({
+                        "smartlockId": smartlock_id,
+                        "reason": "MQTT creation timeout - authorization may still be processing"
+                    })
+                    logger.error(f"❌ Failed to create authorization for smartlock {smartlock_id}: timeout")
+            
+            # Add a delay between smartlocks to prevent race conditions
+            if i < len(auth.smartlockIds) - 1:  # Don't wait after the last one
+                logger.info(f"Waiting before processing next smartlock...")
+                time.sleep(0.5)  # 500ms delay between smartlocks
+                
+        except Exception as e:
+            logger.error(f"❌ Exception while creating authorization for smartlock {smartlock_id}: {e}")
+            failed_creations.append({
+                "smartlockId": smartlock_id,
+                "reason": f"Exception: {str(e)}"
+            })
     
-    # Return the first created auth (Nuki API behavior)
+    # Prepare response
     if created_auths:
-        logger.info(f"Successfully created {len(created_auths)} authorization(s)")
-        return created_auths[0]
+        response_auth = created_auths[0]  # Return the first created auth (Nuki API behavior)
+        logger.info(f"✅ Successfully created {len(created_auths)} authorization(s), {len(failed_creations)} failed")
+        
+        # Add information about failures to the response if any occurred
+        if failed_creations:
+            logger.warning(f"Some failures occurred: {failed_creations}")
+            # Note: In a real scenario, you might want to return this information to the client
+            # But for API compatibility, we just log it
+        
+        return response_auth
     else:
-        raise HTTPException(status_code=500, detail="Failed to create authorization")
+        logger.error(f"❌ Failed to create any authorizations. Failures: {failed_creations}")
+        raise HTTPException(status_code=500, detail=f"Failed to create authorization for all smartlocks: {failed_creations}")
 
 @app.post("/smartlock/{smartlock_id}/auth/{auth_id}")
 def update_smartlock_auth(smartlock_id: int, auth_id: str, auth: SmartlockAuthUpdate):
