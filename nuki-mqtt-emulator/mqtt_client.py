@@ -1106,15 +1106,6 @@ class MQTTClient:
             logger.info(f"Ignoring opener device: {name}")
             return None
         
-        # For the real MQTT system, map werkstatt to smartlock_id 1001
-        if topic_prefix == "werkstatt" and name == "lock":
-            smartlock_id = 1001
-            # Store the mappings
-            self.smartlock_topic_map[smartlock_id] = topic_prefix
-            self.device_name_map[smartlock_id] = f"{topic_prefix}_{name}"
-            logger.info(f"Mapped real MQTT device: {topic_prefix}/{name} -> ID {smartlock_id}")
-            return smartlock_id
-        
         # Create unique topic key for this prefix/device combination
         topic_key = f"{topic_prefix}_{name}"
         
