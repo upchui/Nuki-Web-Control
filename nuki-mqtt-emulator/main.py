@@ -681,6 +681,11 @@ def delete_smartlock_auth(auth_ids: list[str]):
                     logger.info(f"🗑️  Deleting keypad code from smartlock {smartlock_id}: CodeId={code_id}, Name='{auth_name}', Code={code_value}")
                     mqtt_client.publish_keypad_action(smartlock_id, action_data)
                     
+                    # ENHANCED: Also clean up specific MQTT topics for this keypad code
+                    code_index = code.get("index")  # Get the index for targeted cleanup
+                    mqtt_client.cleanup_keypad_code_mqtt_topics(smartlock_id, code_id, code_index)
+                    logger.info(f"🧹 Cleaned up MQTT topics for deleted keypad code {code_id} (index: {code_index})")
+                    
                     # Generate the unique ID for response (same format as API uses)
                     unique_id = f"{smartlock_id}_{code_id}"
                     

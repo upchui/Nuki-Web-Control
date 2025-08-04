@@ -866,7 +866,14 @@ document.addEventListener('DOMContentLoaded', () => {
         //fingerprintsSection.style.display = 'none';
         //fingerprintsList.innerHTML = '';
 
+        // Get the time limit toggle group element
+        const timeLimitToggleGroup = document.querySelector('.time-limit-toggle-group');
+
         if (auth) {
+            // Edit mode - show time limit toggle
+            if (timeLimitToggleGroup) {
+                timeLimitToggleGroup.style.display = '';
+            }
             authModalTitle.textContent = 'Edit Authorization';
             authIdInput.value = JSON.stringify(auth.authIds);
             originalSmartlockIdsInput.value = JSON.stringify(auth.smartlockIds);
@@ -909,6 +916,11 @@ document.addEventListener('DOMContentLoaded', () => {
             renderFingerprints(auth);
 
         } else {
+            // Create mode - hide time limit toggle
+            if (timeLimitToggleGroup) {
+                timeLimitToggleGroup.style.display = 'none';
+            }
+            
             authModalTitle.textContent = 'Create Authorization';
             authIdInput.value = '';
             originalSmartlockIdsInput.value = '';

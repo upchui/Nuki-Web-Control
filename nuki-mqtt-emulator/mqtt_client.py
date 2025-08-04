@@ -544,21 +544,27 @@ class MQTTDataStore:
             codes = self.keypad_codes.get(smartlock_id, [])
             # Find the code to delete and log it
             code_to_delete = None
+            code_index = None
             for code in codes:
                 if code.get("codeId") == code_id:
                     code_to_delete = code
+                    code_index = code.get("index")  # Get the index for MQTT topic cleanup
                     break
             
             if code_to_delete:
-                logger.info(f"Deleting keypad code: ID={code_id}, Name='{code_to_delete.get('name', 'Unknown')}', Smartlock={smartlock_id}")
+                logger.info(f"Deleting keypad code: ID={code_id}, Index={code_index}, Name='{code_to_delete.get('name', 'Unknown')}', Smartlock={smartlock_id}")
                 # Remove the ID mapping
                 string_id = str(code_id)
                 self.id_mapper.remove_mapping(string_id)
+                
+                # FIXED: Remove the code from the list FIRST, before cleanup
+                self.keypad_codes[smartlock_id] = [code for code in codes if code.get("codeId") != code_id]
+                
+                # Return the index for MQTT topic cleanup
+                return code_index
             else:
                 logger.warning(f"Keypad code {code_id} not found for smartlock {smartlock_id}")
-            
-            # Remove the code from the list
-            self.keypad_codes[smartlock_id] = [code for code in codes if code.get("codeId") != code_id]
+                return None
     
     def get_timecontrol_entries(self, smartlock_id: int) -> List[Dict[str, Any]]:
         """Get timecontrol entries for a smartlock"""
@@ -1286,18 +1292,12 @@ class MQTTClient:
             elif action == "delete":
                 code_id = action_data.get("codeId")
                 if code_id:
-                    # Delete from data store
-                    self.data_store.delete_keypad_code(smartlock_id, code_id)
+                    # Delete from data store and get the code index for cleanup
+                    code_index = self.data_store.delete_keypad_code(smartlock_id, code_id)
                     logger.info(f"🗑️ Deleted keypad code {code_id} for smartlock {smartlock_id} from data store")
                     
-                    # Also remove from MQTT retained messages by publishing empty message
-                    device_name = self.get_device_name_from_id(smartlock_id)
-                    if device_name:
-                        topic_prefix = self.smartlock_topic_map.get(smartlock_id, "nukihub")
-                        # Clear individual keypad code topics if they exist
-                        for i in range(10):  # Clear up to 10 possible keypad codes
-                            code_topic = f"{topic_prefix}/{device_name}/keypad/code_{i}"
-                            self.client.publish(code_topic, "", retain=True)
+                    # Clean up specific MQTT topics for this keypad code
+                    self.cleanup_keypad_code_mqtt_topics(smartlock_id, code_id, code_index)
                             
             elif action == "check":
                 # Simulate keypad code check
@@ -1803,6 +1803,69 @@ class MQTTClient:
         self.client.publish(topic, json.dumps(auths), retain=True)
         logger.info(f"Published authorizations for smartlock {smartlock_id}")
     
+    def cleanup_keypad_code_mqtt_topics(self, smartlock_id: int, code_id: int, code_index: int = None):
+        """Clean up specific MQTT topics for a deleted keypad code and update main keypad JSON"""
+        if not self.connected:
+            logger.warning("MQTT not connected, cannot cleanup keypad code topics")
+            return
+        
+        device_name = self.get_device_name_from_id(smartlock_id)
+        if not device_name:
+            logger.warning(f"Unknown smartlock ID: {smartlock_id}")
+            return
+        
+        topic_prefix = self.smartlock_topic_map.get(smartlock_id, "nukihub")
+        
+        # List of specific topics to clean up for this keypad code
+        topics_to_clean = []
+        
+        # If we have the specific index, clean that topic
+        if code_index is not None:
+            topics_to_clean.extend([
+                f"{topic_prefix}/{device_name}/keypad/codes/{code_index}",
+                f"{topic_prefix}/{device_name}/keypad/code_{code_index}"
+            ])
+            logger.info(f"🧹 Cleaning up MQTT topics for keypad code index {code_index}")
+        else:
+            # If no specific index, try to clean up based on codeId as index (fallback)
+            topics_to_clean.extend([
+                f"{topic_prefix}/{device_name}/keypad/codes/{code_id}",
+                f"{topic_prefix}/{device_name}/keypad/code_{code_id}"
+            ])
+            logger.info(f"🧹 Cleaning up MQTT topics for keypad code ID {code_id} (fallback)")
+        
+        # Also clean up a broader range to ensure cleanup
+        for i in range(50):  # Clean up to 50 possible indices
+            topics_to_clean.extend([
+                f"{topic_prefix}/{device_name}/keypad/codes/{i}",
+                f"{topic_prefix}/{device_name}/keypad/code_{i}"
+            ])
+        
+        # Remove duplicates while preserving order
+        topics_to_clean = list(dict.fromkeys(topics_to_clean))
+        
+        # Publish empty retained messages to clean up topics
+        for topic in topics_to_clean:
+            try:
+                self.client.publish(topic, "", retain=True)
+                logger.debug(f"📤 Published empty retained message to clean up topic: {topic}")
+            except Exception as e:
+                logger.error(f"Failed to clean up topic {topic}: {e}")
+        
+        # ENHANCED: Also update the main keypad JSON topic with the current (updated) keypad codes
+        try:
+            keypad_codes = self.data_store.get_keypad_codes(smartlock_id)
+            main_json_topic = f"{topic_prefix}/{device_name}/keypad/json"
+            
+            # Publish the updated keypad codes array (without the deleted code)
+            self.client.publish(main_json_topic, json.dumps(keypad_codes), retain=True)
+            logger.info(f"🔄 Updated main keypad JSON topic: {main_json_topic} (now contains {len(keypad_codes)} codes)")
+            
+        except Exception as e:
+            logger.error(f"Failed to update main keypad JSON topic: {e}")
+        
+        logger.info(f"✅ Cleaned up {len(topics_to_clean)} MQTT topics for keypad code {code_id}")
+
     def publish_command_result(self, smartlock_id: int, result: str):
         """Publish command result to MQTT"""
         if not self.connected:
