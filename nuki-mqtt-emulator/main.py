@@ -303,23 +303,79 @@ def create_smartlock_auth(auth: SmartlockAuthCreate):
                 # Send MQTT action - this will create the keypad code via MQTT handler
                 mqtt_client.publish_keypad_action(smartlock_id, mqtt_action_data)
                 
-                # Wait longer for MQTT processing to complete (FIXED: increased wait time)
-                time.sleep(0.5)  # 500ms wait for MQTT processing
+                # ENHANCED: Longer initial wait for MQTT processing with adaptive timing
+                initial_wait = 0.8 + (i * 0.2)  # Increase wait time for later smartlocks
+                #time.sleep(initial_wait)
+                logger.info(f"Waited {initial_wait}s for MQTT processing for smartlock {smartlock_id}")
                 
-                # Retry logic: try to find the created auth with multiple attempts
+                # ENHANCED: Improved retry logic with validation of Time-Limited fields
                 created_auth = None
-                for attempt in range(3):  # Try up to 3 times
+                max_attempts = 5  # Increased from 3 to 5 attempts
+                for attempt in range(max_attempts):
                     new_auths = [a for a in mqtt_client.data_store.get_authorizations() 
                                 if a.get("smartlockId") == smartlock_id and 
                                    a.get("name") == auth.name and 
                                    a.get("code") == auth.code]
+                    
                     if new_auths:
-                        created_auth = new_auths[-1]  # Take the most recent one
-                        logger.info(f"✅ Successfully created keypad code for smartlock {smartlock_id}: {auth.name}")
-                        break
+                        candidate_auth = new_auths[-1]  # Take the most recent one
+                        
+                        # ENHANCED: Validate Time-Limited fields are correctly set
+                        time_limited_validation_passed = True
+                        
+                        if has_time_restrictions:
+                            # Check if timeLimited fields are present in the created auth
+                            has_date_restrictions = candidate_auth.get("allowedFromDate") or candidate_auth.get("allowedUntilDate")
+                            has_weekday_restrictions = candidate_auth.get("allowedWeekDays", 0) > 0
+                            has_time_restrictions_in_auth = (candidate_auth.get("allowedFromTime") is not None or 
+                                                           candidate_auth.get("allowedUntilTime") is not None)
+                            
+                            if not (has_date_restrictions or has_weekday_restrictions or has_time_restrictions_in_auth):
+                                time_limited_validation_passed = False
+                                logger.warning(f"Attempt {attempt+1}: Time-Limited fields missing in created auth for smartlock {smartlock_id}")
+                            else:
+                                logger.info(f"✅ Time-Limited validation passed for smartlock {smartlock_id}")
+                        
+                        if time_limited_validation_passed:
+                            created_auth = candidate_auth
+                            logger.info(f"✅ Successfully created and validated keypad code for smartlock {smartlock_id}: {auth.name}")
+                            break
+                        else:
+                            logger.warning(f"Attempt {attempt+1}: Time-Limited validation failed for smartlock {smartlock_id}, retrying...")
                     else:
                         logger.warning(f"Attempt {attempt+1}: Auth not found yet for smartlock {smartlock_id}, waiting...")
-                        time.sleep(0.3)  # Wait 300ms before retry
+                    
+                    # ENHANCED: Adaptive retry timing - longer waits for later attempts
+                    retry_wait = 0.4 + (attempt * 0.2)  # 0.4s, 0.6s, 0.8s, 1.0s, 1.2s
+                    #time.sleep(retry_wait)
+                
+                # ENHANCED: If Time-Limited validation failed, try to fix it
+                if created_auth and has_time_restrictions:
+                    # Double-check that Time-Limited fields are present
+                    needs_fix = False
+                    if auth.allowedFromDate and not created_auth.get("allowedFromDate"):
+                        needs_fix = True
+                    if auth.allowedUntilDate and not created_auth.get("allowedUntilDate"):
+                        needs_fix = True
+                    if auth.allowedWeekDays and not created_auth.get("allowedWeekDays"):
+                        needs_fix = True
+                    if auth.allowedFromTime is not None and created_auth.get("allowedFromTime") is None:
+                        needs_fix = True
+                    if auth.allowedUntilTime is not None and created_auth.get("allowedUntilTime") is None:
+                        needs_fix = True
+                    
+                    if needs_fix:
+                        logger.warning(f"🔧 Time-Limited fields incomplete for smartlock {smartlock_id}, attempting to fix...")
+                        # Try to update the code with missing Time-Limited fields
+                        code_id = created_auth.get("authId") or created_auth.get("id").split("_")[-1]
+                        if code_id and str(code_id).isdigit():
+                            fix_action_data = mqtt_action_data.copy()
+                            fix_action_data["action"] = "update"
+                            fix_action_data["codeId"] = int(code_id)
+                            
+                            logger.info(f"🔧 Sending fix update for smartlock {smartlock_id}: {fix_action_data}")
+                            mqtt_client.publish_keypad_action(smartlock_id, fix_action_data)
+                            #time.sleep(0.8)  # Wait for update to process
                 
                 if created_auth:
                     created_auths.append(created_auth)
@@ -412,10 +468,11 @@ def create_smartlock_auth(auth: SmartlockAuthCreate):
                     })
                     logger.error(f"❌ Failed to create authorization for smartlock {smartlock_id}: timeout")
             
-            # Add a delay between smartlocks to prevent race conditions
+            # ENHANCED: Adaptive delay between smartlocks to prevent race conditions
             if i < len(auth.smartlockIds) - 1:  # Don't wait after the last one
-                logger.info(f"Waiting before processing next smartlock...")
-                time.sleep(0.5)  # 500ms delay between smartlocks
+                inter_smartlock_delay = 0.7 + (i * 0.1)  # Increasing delay for later smartlocks
+                logger.info(f"Waiting {inter_smartlock_delay}s before processing next smartlock...")
+                time.sleep(inter_smartlock_delay)
                 
         except Exception as e:
             logger.error(f"❌ Exception while creating authorization for smartlock {smartlock_id}: {e}")
@@ -582,134 +639,69 @@ def delete_smartlock_auth(auth_ids: list[str]):
             
             processed_combinations.add(combination_key)
             
-            logger.info(f"🔍 Searching for ALL authorizations with name='{target_name}' and code={target_code} across all smartlocks")
+            logger.info(f"🔍 Searching for ALL keypad codes with name='{target_name}' and code={target_code} across all smartlocks")
             
-            # Find ALL authorizations with the same name and code across ALL smartlocks
-            all_auths = mqtt_client.data_store.get_authorizations()
-            matching_auths = []
+            # FIXED: Search directly in keypad_codes instead of deduplicated authorizations
+            matching_codes = []
+            with mqtt_client.data_store.lock:
+                for smartlock_id, codes in mqtt_client.data_store.keypad_codes.items():
+                    for code in codes:
+                        if (code.get("name") == target_name and 
+                            code.get("code") == target_code):
+                            # Add smartlock_id to the code for reference
+                            code_with_smartlock = code.copy()
+                            code_with_smartlock["smartlockId"] = smartlock_id
+                            matching_codes.append(code_with_smartlock)
             
-            for auth in all_auths:
-                if (auth.get("name") == target_name and 
-                    auth.get("code") == target_code and 
-                    auth.get("type") == target_type):
-                    matching_auths.append(auth)
+            logger.info(f"📋 Found {len(matching_codes)} matching keypad codes to delete:")
+            for code in matching_codes:
+                logger.info(f"  - CodeId: {code.get('codeId')}, Smartlock: {code.get('smartlockId')}, Name: {code.get('name')}, Code: {code.get('code')}")
             
-            logger.info(f"📋 Found {len(matching_auths)} matching authorizations to delete:")
-            for auth in matching_auths:
-                logger.info(f"  - ID: {auth.get('id')}, Smartlock: {auth.get('smartlockId')}, Name: {auth.get('name')}")
-            
-            # Delete all matching authorizations
-            for auth in matching_auths:
+            # Delete all matching keypad codes
+            for code in matching_codes:
                 try:
-                    auth_to_delete_id = auth.get("id")
-                    smartlock_id = auth.get("smartlockId")
-                    auth_name = auth.get("name", "Unknown")
+                    smartlock_id = code.get("smartlockId")
+                    code_id = code.get("codeId")
+                    auth_name = code.get("name", "Unknown")
+                    code_value = code.get("code")
                     
-                    # Validate that this authorization is safe to delete
-                    if not mqtt_client.data_store.validate_auth_for_deletion(auth, auth_to_delete_id):
+                    if code_id is None:
                         failed_deletions.append({
-                            "id": auth_to_delete_id, 
-                            "reason": "ID validation failed",
-                            "smartlockId": smartlock_id
+                            "smartlockId": smartlock_id,
+                            "reason": "Missing codeId in keypad code",
+                            "name": auth_name
                         })
                         continue
                     
-                    # Check if this is a keypad code (type 13) or regular authorization
-                    if auth.get("type") == 13:
-                        # This is a keypad code - delete via keypad action
-                        try:
-                            # Extract the original codeId from the unique ID format
-                            if "_" in auth_to_delete_id:
-                                # New format: "smartlockId_codeId"
-                                parts = auth_to_delete_id.split("_")
-                                if len(parts) == 2 and parts[1].isdigit():
-                                    numeric_id = int(parts[1])
-                                else:
-                                    raise ValueError(f"Invalid unique ID format: {auth_to_delete_id}")
-                            else:
-                                # Old format: just the codeId
-                                if auth_to_delete_id.isdigit():
-                                    numeric_id = int(auth_to_delete_id)
-                                else:
-                                    # Try to get from authId field
-                                    numeric_id = auth.get("authId")
-                                    if numeric_id is None:
-                                        raise ValueError(f"Cannot determine numeric ID for keypad code {auth_to_delete_id}")
-                            
-                            action_data = {
-                                "action": "delete",
-                                "codeId": numeric_id
-                            }
-                            
-                            logger.info(f"🗑️  Deleting keypad code from smartlock {smartlock_id}: ID={auth_to_delete_id} (numeric={numeric_id}), Name='{auth_name}'")
-                            mqtt_client.publish_keypad_action(smartlock_id, action_data)
-                            
-                            deleted_auths.append({
-                                "id": auth_to_delete_id,
-                                "name": auth_name,
-                                "smartlockId": smartlock_id,
-                                "type": "keypad",
-                                "code": target_code
-                            })
-                            
-                            # Wait between deletions to avoid MQTT flooding
-                            time.sleep(0.2)
-                            
-                        except (ValueError, TypeError) as e:
-                            logger.error(f"Failed to delete keypad code {auth_to_delete_id}: {e}")
-                            failed_deletions.append({
-                                "id": auth_to_delete_id, 
-                                "reason": f"ID conversion error: {e}",
-                                "smartlockId": smartlock_id
-                            })
-                            
-                    else:
-                        # This is a regular authorization - delete via authorization action
-                        try:
-                            # Use the ID mapper to get the correct numeric ID
-                            numeric_id = mqtt_client.data_store.id_mapper.get_numeric_id(auth_to_delete_id)
-                            if numeric_id is None:
-                                # Fallback: use authId from the authorization object
-                                numeric_id = auth.get("authId")
-                            
-                            if numeric_id is None:
-                                # Generate a safe numeric ID (but log this as suspicious)
-                                logger.warning(f"No numeric ID mapping found for authorization {auth_to_delete_id}, generating fallback")
-                                numeric_id = abs(hash(auth_to_delete_id)) % 1000000
-                            
-                            action_data = {
-                                "action": "delete",
-                                "authId": numeric_id
-                            }
-                            
-                            logger.info(f"🗑️  Deleting authorization from smartlock {smartlock_id}: ID={auth_to_delete_id} (numeric={numeric_id}), Name='{auth_name}'")
-                            mqtt_client.publish_authorization_action(smartlock_id, action_data)
-                            
-                            deleted_auths.append({
-                                "id": auth_to_delete_id,
-                                "name": auth_name,
-                                "smartlockId": smartlock_id,
-                                "type": "regular",
-                                "code": target_code
-                            })
-                            
-                            # Wait between deletions to avoid MQTT flooding
-                            time.sleep(0.2)
-                            
-                        except Exception as e:
-                            logger.error(f"Failed to delete authorization {auth_to_delete_id}: {e}")
-                            failed_deletions.append({
-                                "id": auth_to_delete_id, 
-                                "reason": f"Deletion error: {e}",
-                                "smartlockId": smartlock_id
-                            })
-                            
+                    action_data = {
+                        "action": "delete",
+                        "codeId": code_id
+                    }
+                    
+                    logger.info(f"🗑️  Deleting keypad code from smartlock {smartlock_id}: CodeId={code_id}, Name='{auth_name}', Code={code_value}")
+                    mqtt_client.publish_keypad_action(smartlock_id, action_data)
+                    
+                    # Generate the unique ID for response (same format as API uses)
+                    unique_id = f"{smartlock_id}_{code_id}"
+                    
+                    deleted_auths.append({
+                        "id": unique_id,
+                        "name": auth_name,
+                        "smartlockId": smartlock_id,
+                        "type": "keypad",
+                        "code": code_value,
+                        "codeId": code_id
+                    })
+                    
+                    # Wait between deletions to avoid MQTT flooding
+                    time.sleep(0.2)
+                    
                 except Exception as e:
-                    logger.error(f"Unexpected error processing authorization {auth.get('id')}: {e}")
+                    logger.error(f"Failed to delete keypad code from smartlock {code.get('smartlockId')}: {e}")
                     failed_deletions.append({
-                        "id": auth.get("id"), 
-                        "reason": f"Unexpected error: {e}",
-                        "smartlockId": auth.get("smartlockId")
+                        "smartlockId": code.get("smartlockId"), 
+                        "reason": f"Deletion error: {e}",
+                        "name": code.get("name", "Unknown")
                     })
                     
         except Exception as e:
@@ -718,7 +710,7 @@ def delete_smartlock_auth(auth_ids: list[str]):
     
     # Prepare response with detailed information
     response = {
-        "message": f"Successfully deleted {len(deleted_auths)} authorization(s) with matching name+code from all smartlocks",
+        "message": f"Successfully deleted {len(deleted_auths)} keypad code(s) with matching name+code from all smartlocks",
         "deleted": deleted_auths,
         "deleted_count": len(deleted_auths)
     }

@@ -170,7 +170,7 @@ class MQTTDataStore:
         logger.info(f"Created new smartlock {smartlock_id} ({device_name}) from MQTT discovery")
     
     def get_authorizations(self) -> List[Dict[str, Any]]:
-        """Get all authorizations - convert keypad codes to authorization format"""
+        """Get all authorizations - convert keypad codes to authorization format with deduplication"""
         with self.lock:
             # Convert keypad codes to authorization format for API compatibility
             auth_list = []
@@ -247,11 +247,40 @@ class MQTTDataStore:
                             "allowedUntilTime": convert_time_to_minutes(allowed_until_time),  # FIXED: Return 0 for "00:00"
                         })
                     
-                    # Debug logging to see what we're converting
-                    logger.info(f"Converting keypad code: {code}")
-                    logger.info(f"Converted to auth: {auth}")
-                    
                     auth_list.append(auth)
+            
+            # DEDUPLICATION: Group by smartlockId+name+code combination to remove duplicates within same smartlock
+            if auth_list:
+                # Group authorizations by smartlockId+name+code combination
+                grouped_auths = {}
+                for auth in auth_list:
+                    smartlock_id = auth.get("smartlockId")
+                    name = auth.get("name", "Unknown")
+                    code = auth.get("code")
+                    group_key = f"{smartlock_id}_{name}_{code}"
+                    
+                    if group_key not in grouped_auths:
+                        grouped_auths[group_key] = []
+                    grouped_auths[group_key].append(auth)
+                
+                # Select representative from each group (if there are duplicates within same smartlock)
+                deduplicated_list = []
+                duplicates_removed = 0
+                for group_key, group_auths in grouped_auths.items():
+                    if len(group_auths) > 1:
+                        # Sort by ID to get consistent selection
+                        group_auths.sort(key=lambda x: x.get("id", ""))
+                        representative = group_auths[0]  # Take the first one
+                        duplicates_removed += len(group_auths) - 1
+                        logger.info(f"Deduplication: '{group_key}' had {len(group_auths)} duplicates, selected ID {representative.get('id')}")
+                    else:
+                        representative = group_auths[0]  # Only one entry, use it
+                    
+                    deduplicated_list.append(representative)
+                
+                if duplicates_removed > 0:
+                    logger.info(f"Deduplication complete: removed {duplicates_removed} duplicates within same smartlocks")
+                return deduplicated_list
             
             # DO NOT add regular authorizations - only return keypad codes as authorizations
             # The regular authorizations (like "Büro - Alex Wohnung", "Nuki Keypad", etc.) 
@@ -1210,25 +1239,56 @@ class MQTTClient:
             logger.error(f"Error handling lock action: {e}")
     
     def handle_keypad_action(self, smartlock_id: int, payload: str):
-        """Handle keypad code management actions"""
+        """Handle keypad code management actions with enhanced Time-Limited processing"""
         try:
             action_data = json.loads(payload)
             action = action_data.get("action")
             
+            # ENHANCED: Log incoming action data for debugging
+            logger.info(f"Processing keypad action for smartlock {smartlock_id}: {action}")
+            logger.debug(f"Action data: {action_data}")
+            
             if action == "add":
-                self.data_store.add_keypad_code(smartlock_id, action_data)
-                logger.info(f"Added keypad code for smartlock {smartlock_id}")
+                # ENHANCED: Validate and process Time-Limited fields before adding
+                processed_data = self._process_time_limited_fields(action_data)
+                self.data_store.add_keypad_code(smartlock_id, processed_data)
+                
+                # Log what was actually stored
+                code_name = processed_data.get("name", "Unknown")
+                time_limited = processed_data.get("timeLimited", 0)
+                logger.info(f"✅ Added keypad code '{code_name}' for smartlock {smartlock_id} (timeLimited: {time_limited})")
+                
+                if time_limited == 1:
+                    logger.info(f"🕒 Time-Limited fields: allowedFrom={processed_data.get('allowedFrom')}, " +
+                              f"allowedUntil={processed_data.get('allowedUntil')}, " +
+                              f"allowedWeekdays={processed_data.get('allowedWeekdays')}, " +
+                              f"allowedFromTime={processed_data.get('allowedFromTime')}, " +
+                              f"allowedUntilTime={processed_data.get('allowedUntilTime')}")
+                
             elif action == "update":
                 code_id = action_data.get("codeId")
                 if code_id:
-                    self.data_store.update_keypad_code(smartlock_id, code_id, action_data)
-                    logger.info(f"Updated keypad code {code_id} for smartlock {smartlock_id}")
+                    # ENHANCED: Process Time-Limited fields for updates too
+                    processed_data = self._process_time_limited_fields(action_data)
+                    self.data_store.update_keypad_code(smartlock_id, code_id, processed_data)
+                    
+                    code_name = processed_data.get("name", "Unknown")
+                    time_limited = processed_data.get("timeLimited", 0)
+                    logger.info(f"✅ Updated keypad code {code_id} '{code_name}' for smartlock {smartlock_id} (timeLimited: {time_limited})")
+                    
+                    if time_limited == 1:
+                        logger.info(f"🕒 Updated Time-Limited fields: allowedFrom={processed_data.get('allowedFrom')}, " +
+                                  f"allowedUntil={processed_data.get('allowedUntil')}, " +
+                                  f"allowedWeekdays={processed_data.get('allowedWeekdays')}, " +
+                                  f"allowedFromTime={processed_data.get('allowedFromTime')}, " +
+                                  f"allowedUntilTime={processed_data.get('allowedUntilTime')}")
+                
             elif action == "delete":
                 code_id = action_data.get("codeId")
                 if code_id:
                     # Delete from data store
                     self.data_store.delete_keypad_code(smartlock_id, code_id)
-                    logger.info(f"Deleted keypad code {code_id} for smartlock {smartlock_id} from data store")
+                    logger.info(f"🗑️ Deleted keypad code {code_id} for smartlock {smartlock_id} from data store")
                     
                     # Also remove from MQTT retained messages by publishing empty message
                     device_name = self.get_device_name_from_id(smartlock_id)
@@ -1238,6 +1298,7 @@ class MQTTClient:
                         for i in range(10):  # Clear up to 10 possible keypad codes
                             code_topic = f"{topic_prefix}/{device_name}/keypad/code_{i}"
                             self.client.publish(code_topic, "", retain=True)
+                            
             elif action == "check":
                 # Simulate keypad code check
                 code = str(action_data.get("code", ""))
@@ -1246,7 +1307,7 @@ class MQTTClient:
                 if valid_code:
                     self.handle_lock_action(smartlock_id, "unlock")
             
-            # Publish updated keypad codes (this will reflect the deletion)
+            # Publish updated keypad codes (this will reflect the changes)
             self.publish_keypad_codes(smartlock_id)
             self.publish_command_result(smartlock_id, "success")
             
@@ -1256,6 +1317,72 @@ class MQTTClient:
         except Exception as e:
             logger.error(f"Error in keypad action: {e}")
             self.publish_command_result(smartlock_id, "failed")
+    
+    def _process_time_limited_fields(self, action_data: dict) -> dict:
+        """Process and validate Time-Limited fields for keypad codes"""
+        processed_data = action_data.copy()
+        
+        # Check if any time restriction fields are present
+        has_time_restrictions = any([
+            action_data.get("allowedFrom"),
+            action_data.get("allowedUntil"),
+            action_data.get("allowedWeekdays"),
+            action_data.get("allowedFromTime"),
+            action_data.get("allowedUntilTime")
+        ])
+        
+        # ENHANCED: Ensure timeLimited flag is set correctly
+        explicit_time_limited = action_data.get("timeLimited")
+        if explicit_time_limited is not None:
+            # Use explicit value from the request
+            processed_data["timeLimited"] = int(explicit_time_limited)
+            logger.debug(f"Using explicit timeLimited value: {processed_data['timeLimited']}")
+        elif has_time_restrictions:
+            # Auto-set to 1 if time restrictions are present
+            processed_data["timeLimited"] = 1
+            logger.debug(f"Auto-setting timeLimited = 1 due to time restrictions")
+        else:
+            # Default to 0 if no time restrictions
+            processed_data["timeLimited"] = 0
+            logger.debug(f"Setting timeLimited = 0 (no time restrictions)")
+        
+        # ENHANCED: Validate and normalize time-related fields
+        if processed_data.get("timeLimited") == 1:
+            # Ensure date fields are in correct format
+            for date_field in ["allowedFrom", "allowedUntil"]:
+                if date_field in processed_data and processed_data[date_field]:
+                    date_value = processed_data[date_field]
+                    # Ensure format is "YYYY-MM-DD HH:MM:SS"
+                    if "T" in date_value:
+                        processed_data[date_field] = date_value.replace("T", " ").replace(".000Z", "")
+                        logger.debug(f"Normalized {date_field}: {processed_data[date_field]}")
+            
+            # Ensure weekdays field is properly formatted
+            if "allowedWeekdays" in processed_data and processed_data["allowedWeekdays"]:
+                weekdays = processed_data["allowedWeekdays"]
+                if isinstance(weekdays, list):
+                    # Already in correct format
+                    logger.debug(f"Weekdays already in list format: {weekdays}")
+                else:
+                    logger.warning(f"Unexpected weekdays format: {weekdays} (type: {type(weekdays)})")
+            
+            # Ensure time fields are in HH:MM format
+            for time_field in ["allowedFromTime", "allowedUntilTime"]:
+                if time_field in processed_data and processed_data[time_field] is not None:
+                    time_value = processed_data[time_field]
+                    if isinstance(time_value, str) and ":" in time_value:
+                        # Already in HH:MM format
+                        logger.debug(f"{time_field} already in HH:MM format: {time_value}")
+                    else:
+                        logger.debug(f"{time_field} value: {time_value} (type: {type(time_value)})")
+        
+        # Add creation/update timestamps
+        current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        if action_data.get("action") == "add":
+            processed_data["dateCreated"] = current_time
+        processed_data["dateUpdated"] = current_time
+        
+        return processed_data
     
     def handle_timecontrol_action(self, smartlock_id: int, payload: str):
         """Handle timecontrol entry management"""
