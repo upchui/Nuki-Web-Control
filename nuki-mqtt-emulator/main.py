@@ -12,6 +12,7 @@ from datetime import datetime
 # Import our modules
 from mqtt_client import mqtt_client
 from log_manager import LogCollector
+from auth_state_manager import auth_state_manager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,6 +29,10 @@ async def lifespan(app: FastAPI):
     
     # Connect to MQTT broker
     mqtt_client.connect()
+    
+    # Set auth_state_manager reference in MQTT client
+    auth_state_manager.set_mqtt_client(mqtt_client)
+    mqtt_client.set_auth_state_manager(auth_state_manager)
     
     # Initialize and start log collector
     collection_enabled = os.getenv("LOG_COLLECTION_ENABLED", "true").lower() == "true"
@@ -300,6 +305,18 @@ def create_smartlock_auth(auth: SmartlockAuthCreate):
                 
                 logger.info(f"Sending MQTT keypad action for smartlock {smartlock_id}: {mqtt_action_data}")
                 
+                # 🔒 ENHANCED STATE MANAGEMENT: Suche und entferne matching Authorizations aus RAM BEVOR Erstellung
+                removed_auths = auth_state_manager.find_and_remove_by_pin_and_name(
+                    smartlock_id=smartlock_id,
+                    pin=auth.code,
+                    name=auth.name,
+                    reason="api_create_preparation"
+                )
+                if removed_auths:
+                    logger.info(f"🔍 Found and removed {len(removed_auths)} matching authorization(s) from RAM before creating '{auth.name}' (PIN: {auth.code})")
+                    for removed in removed_auths:
+                        logger.info(f"  - Removed: '{removed['name']}' (PIN: {removed['code']}, ID: {removed['auth_id']})")
+                
                 # Send MQTT action - this will create the keypad code via MQTT handler
                 mqtt_client.publish_keypad_action(smartlock_id, mqtt_action_data)
                 
@@ -379,6 +396,26 @@ def create_smartlock_auth(auth: SmartlockAuthCreate):
                 
                 if created_auth:
                     created_auths.append(created_auth)
+                    
+                    # 🔒 ENHANCED STATE MANAGEMENT: Save the newly created authorization with ALL properties as expected state
+                    current_auths = mqtt_client.data_store.get_authorizations()
+                    auth_state_manager.save_current_state_with_all_properties(
+                        smartlock_id=smartlock_id,
+                        authorizations=current_auths,
+                        source="api_create",
+                        reason="after_keypad_creation"
+                    )
+                    logger.info(f"💾 Saved COMPLETE authorization state after creating '{auth.name}' on smartlock {smartlock_id}")
+                    
+                    # ENHANCED: Start verification thread to ensure enabled state is correct
+                    mqtt_client.start_authorization_verification_thread(
+                        smartlock_id=smartlock_id,
+                        expected_name=auth.name,
+                        expected_enabled=auth.enabled,
+                        expected_code=auth.code,
+                        max_attempts=5
+                    )
+                    logger.info(f"🔍 Started verification thread for '{auth.name}' on smartlock {smartlock_id}")
                 else:
                     # Create a fallback response but mark as failed
                     created_auth = {
@@ -506,11 +543,55 @@ def update_smartlock_auth(smartlock_id: int, auth_id: str, auth: SmartlockAuthUp
     if not existing_auth or existing_auth.get("smartlockId") != smartlock_id:
         raise HTTPException(status_code=404, detail="Authorization not found")
     
+    # 🔒 ENHANCED STATE MANAGEMENT: Suche und entferne matching Authorizations aus RAM BEVOR Update
+    removed_auths = auth_state_manager.find_and_remove_by_pin_and_name(
+        smartlock_id=smartlock_id,
+        pin=auth.code,
+        name=auth.name,
+        reason="api_update_preparation"
+    )
+    if removed_auths:
+        logger.info(f"🔍 Found and removed {len(removed_auths)} matching authorization(s) from RAM before updating '{auth.name}' (PIN: {auth.code})")
+        for removed in removed_auths:
+            logger.info(f"  - Removed: '{removed['name']}' (PIN: {removed['code']}, ID: {removed['auth_id']})")
+    else:
+        # Fallback: Remove specific authorization from expected state BEFORE update
+        auth_state_manager.remove_authorization_from_expected_state(
+            smartlock_id=smartlock_id,
+            auth_id=auth_id,
+            reason="api_update_before"
+        )
+        logger.info(f"🔄 Removed old authorization '{auth.name}' (ID: {auth_id}) from expected state before update")
+    
     # Check if this is a keypad code (type 13)
     if existing_auth.get("type") == 13:
         # This is a keypad code - use keypad action
         action_data = _convert_api_to_mqtt_keypad(auth, auth_id)
         mqtt_client.publish_keypad_action(smartlock_id, action_data)
+        
+        # ENHANCED: Start verification thread for keypad code updates
+        if auth.enabled is not None:
+            mqtt_client.start_authorization_verification_thread(
+                smartlock_id=smartlock_id,
+                expected_name=auth.name,
+                expected_enabled=auth.enabled,
+                expected_code=auth.code,
+                max_attempts=3
+            )
+            logger.info(f"🔍 Started verification thread for keypad update '{auth.name}' on smartlock {smartlock_id}")
+        
+        # 🔒 ENHANCED STATE MANAGEMENT: Save updated authorization state with ALL properties after successful update
+        import time
+        time.sleep(1.0)  # Wait for MQTT processing
+        current_auths = mqtt_client.data_store.get_authorizations()
+        auth_state_manager.save_current_state_with_all_properties(
+            smartlock_id=smartlock_id,
+            authorizations=current_auths,
+            source="api_update",
+            reason="after_keypad_update"
+        )
+        logger.info(f"💾 Saved COMPLETE updated authorization state for '{auth.name}' on smartlock {smartlock_id}")
+        
     else:
         # Regular authorization - use authorization action
         action_data = {
@@ -537,6 +618,29 @@ def update_smartlock_auth(smartlock_id: int, auth_id: str, auth: SmartlockAuthUp
             action_data["remoteAllowed"] = 1 if auth.remoteAllowed else 0
         
         mqtt_client.publish_authorization_action(smartlock_id, action_data)
+        
+        # ENHANCED: Start verification thread for regular authorization updates
+        if auth.enabled is not None:
+            mqtt_client.start_authorization_verification_thread(
+                smartlock_id=smartlock_id,
+                expected_name=auth.name,
+                expected_enabled=auth.enabled,
+                expected_code=auth.code,
+                max_attempts=3
+            )
+            logger.info(f"🔍 Started verification thread for authorization update '{auth.name}' on smartlock {smartlock_id}")
+        
+        # 🔒 STATE MANAGEMENT: Save updated authorization state after successful update
+        import time
+        time.sleep(1.0)  # Wait for MQTT processing
+        current_auths = mqtt_client.data_store.get_authorizations()
+        auth_state_manager.save_current_state(
+            smartlock_id=smartlock_id,
+            authorizations=current_auths,
+            source="api_update",
+            reason="after_auth_update"
+        )
+        logger.info(f"💾 Saved updated authorization state for '{auth.name}' on smartlock {smartlock_id}")
     
     return {"message": "Authorization updated successfully"}
 
@@ -609,105 +713,112 @@ def _convert_api_to_mqtt_keypad(auth: SmartlockAuthUpdate, auth_id: str) -> dict
 
 @app.delete("/smartlock/auth")
 def delete_smartlock_auth(auth_ids: list[str]):
-    """Delete smartlock authorizations - finds all auths with same name+code across all smartlocks"""
+    """Delete smartlock authorizations - deletes only from specific smartlocks based on auth_id"""
     
     deleted_auths = []
     failed_deletions = []
-    processed_combinations = set()  # To avoid deleting the same name+code combination multiple times
     
     import time
     
     for auth_id in auth_ids:
         try:
-            # Get the first authorization to understand what we're looking for
-            target_auth = mqtt_client.data_store.get_authorization_safe(auth_id)
-            if not target_auth:
-                failed_deletions.append({"id": auth_id, "reason": "Authorization not found"})
-                continue
+            logger.info(f"🗑️ Processing deletion request for auth_id: {auth_id}")
             
-            target_name = target_auth.get("name", "")
-            target_code = target_auth.get("code")
-            target_type = target_auth.get("type", 13)  # Assume keypad type if not specified
+            # Parse auth_id to extract smartlock_id and code_id
+            if "_" in auth_id:
+                # New format: "smartlock_id_code_id"
+                parts = auth_id.split("_")
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    target_smartlock_id = int(parts[0])
+                    target_code_id = int(parts[1])
+                else:
+                    failed_deletions.append({"id": auth_id, "reason": "Invalid auth_id format"})
+                    continue
+            else:
+                # Old format or invalid - try to find the authorization first
+                target_auth = mqtt_client.data_store.get_authorization_safe(auth_id)
+                if not target_auth:
+                    failed_deletions.append({"id": auth_id, "reason": "Authorization not found"})
+                    continue
+                
+                target_smartlock_id = target_auth.get("smartlockId")
+                # Extract code_id from the auth_id or authId
+                if auth_id.isdigit():
+                    target_code_id = int(auth_id)
+                else:
+                    failed_deletions.append({"id": auth_id, "reason": "Cannot determine code_id from auth_id"})
+                    continue
             
-            # Create a unique key for this name+code combination
-            combination_key = f"{target_name}_{target_code}_{target_type}"
+            logger.info(f"🎯 Deleting from smartlock {target_smartlock_id}, code_id {target_code_id}")
             
-            # Skip if we already processed this combination
-            if combination_key in processed_combinations:
-                logger.info(f"Skipping {auth_id} - already processed combination: {target_name} (code: {target_code})")
-                continue
-            
-            processed_combinations.add(combination_key)
-            
-            logger.info(f"🔍 Searching for ALL keypad codes with name='{target_name}' and code={target_code} across all smartlocks")
-            
-            # FIXED: Search directly in keypad_codes instead of deduplicated authorizations
-            matching_codes = []
+            # Find the specific keypad code in the target smartlock
+            target_code = None
             with mqtt_client.data_store.lock:
-                for smartlock_id, codes in mqtt_client.data_store.keypad_codes.items():
-                    for code in codes:
-                        if (code.get("name") == target_name and 
-                            code.get("code") == target_code):
-                            # Add smartlock_id to the code for reference
-                            code_with_smartlock = code.copy()
-                            code_with_smartlock["smartlockId"] = smartlock_id
-                            matching_codes.append(code_with_smartlock)
+                codes = mqtt_client.data_store.keypad_codes.get(target_smartlock_id, [])
+                for code in codes:
+                    if code.get("codeId") == target_code_id:
+                        target_code = code
+                        break
             
-            logger.info(f"📋 Found {len(matching_codes)} matching keypad codes to delete:")
-            for code in matching_codes:
-                logger.info(f"  - CodeId: {code.get('codeId')}, Smartlock: {code.get('smartlockId')}, Name: {code.get('name')}, Code: {code.get('code')}")
+            if not target_code:
+                failed_deletions.append({
+                    "id": auth_id,
+                    "smartlockId": target_smartlock_id,
+                    "reason": f"Keypad code {target_code_id} not found in smartlock {target_smartlock_id}"
+                })
+                continue
             
-            # Delete all matching keypad codes
-            for code in matching_codes:
-                try:
-                    smartlock_id = code.get("smartlockId")
-                    code_id = code.get("codeId")
-                    auth_name = code.get("name", "Unknown")
-                    code_value = code.get("code")
-                    
-                    if code_id is None:
-                        failed_deletions.append({
-                            "smartlockId": smartlock_id,
-                            "reason": "Missing codeId in keypad code",
-                            "name": auth_name
-                        })
-                        continue
-                    
-                    action_data = {
-                        "action": "delete",
-                        "codeId": code_id
-                    }
-                    
-                    logger.info(f"🗑️  Deleting keypad code from smartlock {smartlock_id}: CodeId={code_id}, Name='{auth_name}', Code={code_value}")
-                    mqtt_client.publish_keypad_action(smartlock_id, action_data)
-                    
-                    # ENHANCED: Also clean up specific MQTT topics for this keypad code
-                    code_index = code.get("index")  # Get the index for targeted cleanup
-                    mqtt_client.cleanup_keypad_code_mqtt_topics(smartlock_id, code_id, code_index)
-                    logger.info(f"🧹 Cleaned up MQTT topics for deleted keypad code {code_id} (index: {code_index})")
-                    
-                    # Generate the unique ID for response (same format as API uses)
-                    unique_id = f"{smartlock_id}_{code_id}"
-                    
-                    deleted_auths.append({
-                        "id": unique_id,
-                        "name": auth_name,
-                        "smartlockId": smartlock_id,
-                        "type": "keypad",
-                        "code": code_value,
-                        "codeId": code_id
-                    })
-                    
-                    # Wait between deletions to avoid MQTT flooding
-                    time.sleep(0.2)
-                    
-                except Exception as e:
-                    logger.error(f"Failed to delete keypad code from smartlock {code.get('smartlockId')}: {e}")
-                    failed_deletions.append({
-                        "smartlockId": code.get("smartlockId"), 
-                        "reason": f"Deletion error: {e}",
-                        "name": code.get("name", "Unknown")
-                    })
+            # Delete the specific keypad code
+            auth_name = target_code.get("name", "Unknown")
+            code_value = target_code.get("code")
+            
+            action_data = {
+                "action": "delete",
+                "codeId": target_code_id
+            }
+            
+            logger.info(f"🗑️ Deleting keypad code from smartlock {target_smartlock_id}: CodeId={target_code_id}, Name='{auth_name}', Code={code_value}")
+            
+            # 🔧 CRITICAL FIX: Sofortige Entfernung aus dem RAM BEVOR MQTT-Aktion
+            with mqtt_client.data_store.lock:
+                codes = mqtt_client.data_store.keypad_codes.get(target_smartlock_id, [])
+                original_count = len(codes)
+                mqtt_client.data_store.keypad_codes[target_smartlock_id] = [
+                    code for code in codes if code.get("codeId") != target_code_id
+                ]
+                new_count = len(mqtt_client.data_store.keypad_codes[target_smartlock_id])
+                logger.info(f"🗑️ IMMEDIATE RAM DELETION: Removed keypad code {target_code_id} from RAM ({original_count} -> {new_count} codes)")
+            
+            # Jetzt MQTT-Aktion senden (ohne auto-restore durch unseren Fix)
+            mqtt_client.publish_keypad_action(target_smartlock_id, action_data)
+            
+            # Clean up specific MQTT topics for this keypad code
+            code_index = target_code.get("index")  # Get the index for targeted cleanup
+            mqtt_client.cleanup_keypad_code_mqtt_topics(target_smartlock_id, target_code_id, code_index)
+            logger.info(f"🧹 Cleaned up MQTT topics for deleted keypad code {target_code_id} (index: {code_index})")
+            
+            # Generate the unique ID for response (same format as API uses)
+            unique_id = f"{target_smartlock_id}_{target_code_id}"
+            
+            deleted_auths.append({
+                "id": unique_id,
+                "name": auth_name,
+                "smartlockId": target_smartlock_id,
+                "type": "keypad",
+                "code": code_value,
+                "codeId": target_code_id
+            })
+            
+            # 🔒 STATE MANAGEMENT: Remove from expected state to prevent auto-recreation
+            auth_state_manager.remove_authorization_from_expected_state(
+                smartlock_id=target_smartlock_id,
+                auth_id=unique_id,
+                reason="api_delete"
+            )
+            logger.info(f"🗑️ Removed authorization '{auth_name}' (ID: {unique_id}) from expected state after deletion")
+            
+            # Wait between deletions to avoid MQTT flooding
+            time.sleep(0.2)
                     
         except Exception as e:
             logger.error(f"Unexpected error processing auth_id {auth_id}: {e}")
@@ -715,7 +826,7 @@ def delete_smartlock_auth(auth_ids: list[str]):
     
     # Prepare response with detailed information
     response = {
-        "message": f"Successfully deleted {len(deleted_auths)} keypad code(s) with matching name+code from all smartlocks",
+        "message": f"Successfully deleted {len(deleted_auths)} keypad code(s) from specific smartlocks",
         "deleted": deleted_auths,
         "deleted_count": len(deleted_auths)
     }
@@ -725,18 +836,11 @@ def delete_smartlock_auth(auth_ids: list[str]):
         response["failed_count"] = len(failed_deletions)
         response["message"] += f", {len(failed_deletions)} failed"
     
-    # Group deleted auths by name+code for better logging
+    # Log individual deletions for better visibility
     if deleted_auths:
-        grouped_deletions = {}
-        for auth in deleted_auths:
-            key = f"{auth['name']} (code: {auth['code']})"
-            if key not in grouped_deletions:
-                grouped_deletions[key] = []
-            grouped_deletions[key].append(auth['smartlockId'])
-        
         logger.info("✅ DELETION SUMMARY:")
-        for name_code, smartlock_ids in grouped_deletions.items():
-            logger.info(f"  - {name_code}: deleted from smartlocks {smartlock_ids}")
+        for auth in deleted_auths:
+            logger.info(f"  - Deleted '{auth['name']}' (code: {auth['code']}) from smartlock {auth['smartlockId']}")
     
     return response
 
@@ -960,6 +1064,184 @@ def get_log_statistics():
     stats['timestamp'] = datetime.utcnow().isoformat()
     
     return stats
+
+# 🔒 AUTHORIZATION STATE MANAGEMENT ADMIN ENDPOINTS
+
+@app.get("/admin/auth-state/status")
+def get_auth_state_status():
+    """Get authorization state monitoring status for all smartlocks"""
+    try:
+        status = auth_state_manager.get_monitoring_status()
+        return status
+    except Exception as e:
+        logger.error(f"Error getting auth state status: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get auth state status: {str(e)}")
+
+@app.post("/admin/auth-state/{smartlock_id}/restore")
+def manual_restore_auth_state(smartlock_id: int):
+    """Manually trigger authorization state restoration for a specific smartlock"""
+    try:
+        # Check if smartlock exists
+        smartlock = mqtt_client.data_store.get_smartlock(smartlock_id)
+        if not smartlock:
+            raise HTTPException(status_code=404, detail="Smartlock not found")
+        
+        # Get current authorizations
+        current_auths = mqtt_client.data_store.get_authorizations()
+        
+        # Trigger manual restoration
+        result = auth_state_manager.manual_restore(smartlock_id, current_auths)
+        
+        logger.info(f"Manual restoration triggered for smartlock {smartlock_id}: {result}")
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in manual restore for smartlock {smartlock_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to restore auth state: {str(e)}")
+
+@app.post("/admin/auth-state/{smartlock_id}/save")
+def save_auth_state(smartlock_id: int):
+    """Manually save current authorization state as expected state for a smartlock"""
+    try:
+        # Check if smartlock exists
+        smartlock = mqtt_client.data_store.get_smartlock(smartlock_id)
+        if not smartlock:
+            raise HTTPException(status_code=404, detail="Smartlock not found")
+        
+        # Get current authorizations
+        current_auths = mqtt_client.data_store.get_authorizations()
+        
+        # Save current state as expected state
+        auth_state_manager.save_current_state(
+            smartlock_id=smartlock_id,
+            authorizations=current_auths,
+            source="manual",
+            reason="admin_save"
+        )
+        
+        # Count how many authorizations were saved for this smartlock
+        relevant_auths = [
+            auth for auth in current_auths 
+            if (auth.get("smartlockId") == smartlock_id and 
+                auth.get("type") == 13)
+        ]
+        
+        logger.info(f"Manually saved auth state for smartlock {smartlock_id}: {len(relevant_auths)} authorizations")
+        
+        return {
+            "message": "Authorization state saved successfully",
+            "smartlock_id": smartlock_id,
+            "authorizations_saved": len(relevant_auths),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error saving auth state for smartlock {smartlock_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save auth state: {str(e)}")
+
+@app.post("/admin/auth-state/{smartlock_id}/enable-monitoring")
+def enable_auth_state_monitoring(smartlock_id: int):
+    """Enable authorization state monitoring for a specific smartlock"""
+    try:
+        # Check if smartlock exists
+        smartlock = mqtt_client.data_store.get_smartlock(smartlock_id)
+        if not smartlock:
+            raise HTTPException(status_code=404, detail="Smartlock not found")
+        
+        auth_state_manager.enable_monitoring(smartlock_id)
+        
+        return {
+            "message": f"Authorization state monitoring enabled for smartlock {smartlock_id}",
+            "smartlock_id": smartlock_id,
+            "monitoring_enabled": True,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error enabling monitoring for smartlock {smartlock_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to enable monitoring: {str(e)}")
+
+@app.post("/admin/auth-state/{smartlock_id}/disable-monitoring")
+def disable_auth_state_monitoring(smartlock_id: int):
+    """Disable authorization state monitoring for a specific smartlock"""
+    try:
+        # Check if smartlock exists
+        smartlock = mqtt_client.data_store.get_smartlock(smartlock_id)
+        if not smartlock:
+            raise HTTPException(status_code=404, detail="Smartlock not found")
+        
+        auth_state_manager.disable_monitoring(smartlock_id)
+        
+        return {
+            "message": f"Authorization state monitoring disabled for smartlock {smartlock_id}",
+            "smartlock_id": smartlock_id,
+            "monitoring_enabled": False,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error disabling monitoring for smartlock {smartlock_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to disable monitoring: {str(e)}")
+
+@app.delete("/admin/auth-state/{smartlock_id}/clear")
+def clear_auth_state(smartlock_id: int):
+    """Clear expected authorization state for a smartlock (disables monitoring)"""
+    try:
+        # Check if smartlock exists
+        smartlock = mqtt_client.data_store.get_smartlock(smartlock_id)
+        if not smartlock:
+            raise HTTPException(status_code=404, detail="Smartlock not found")
+        
+        auth_state_manager.clear_expected_state(smartlock_id)
+        
+        return {
+            "message": f"Authorization state cleared for smartlock {smartlock_id}",
+            "smartlock_id": smartlock_id,
+            "monitoring_enabled": False,
+            "expected_state_removed": True,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error clearing auth state for smartlock {smartlock_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to clear auth state: {str(e)}")
+
+@app.get("/admin/auth-state/{smartlock_id}/check")
+def check_auth_state_changes(smartlock_id: int):
+    """Check for authorization state changes for a specific smartlock"""
+    try:
+        # Check if smartlock exists
+        smartlock = mqtt_client.data_store.get_smartlock(smartlock_id)
+        if not smartlock:
+            raise HTTPException(status_code=404, detail="Smartlock not found")
+        
+        # Get current authorizations
+        current_auths = mqtt_client.data_store.get_authorizations()
+        
+        # Check for changes
+        change_result = auth_state_manager.check_for_changes(smartlock_id, current_auths)
+        
+        return {
+            "smartlock_id": smartlock_id,
+            "change_check_result": change_result,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error checking auth state changes for smartlock {smartlock_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to check auth state changes: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

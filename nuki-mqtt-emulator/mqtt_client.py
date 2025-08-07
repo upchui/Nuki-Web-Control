@@ -9,8 +9,9 @@ import paho.mqtt.client as mqtt
 from datetime import datetime
 import uuid
 
-# Import log manager
+# Import log manager and auth state manager
 from log_manager import LogManager
+from auth_state_manager import auth_state_manager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -177,6 +178,9 @@ class MQTTDataStore:
             
             # Add keypad codes as authorizations
             for smartlock_id, codes in self.keypad_codes.items():
+                # SAFETY CHECK: Ensure codes is not None (could happen after deletions)
+                if codes is None:
+                    continue
                 for code in codes:
                     # Generate globally unique IDs by combining smartlock_id and codeId
                     code_id = code.get("codeId", "unknown")
@@ -917,6 +921,10 @@ class MQTTClient:
         self.mqtt_username = os.getenv("MQTT_USERNAME")
         self.mqtt_password = os.getenv("MQTT_PASSWORD")
         
+        # Enhanced verification tracking
+        self.mqtt_latency_tracker = {}  # Track MQTT response times
+        self.enabled_status_cache = {}  # Cache for consistent enabled status
+        
         # Dynamic topic discovery - no fixed prefix
         self.discovered_topics = set()
         self.smartlock_topic_map = {}  # smartlock_id -> topic_prefix
@@ -930,6 +938,10 @@ class MQTTClient:
         # Track our own published messages to avoid processing them
         self.published_messages = set()  # Track message hashes to avoid self-processing
         
+        # Authorization verification tracking
+        self.pending_verifications = {}  # auth_id -> verification_data
+        self.verification_lock = threading.RLock()
+        
         # Connection state
         self.connected = False
         self.reconnect_delay = 5
@@ -942,9 +954,53 @@ class MQTTClient:
         max_logs_per_smartlock = int(os.getenv("MAX_LOGS_PER_SMARTLOCK", "500"))
         self.log_manager = LogManager(log_storage_path, max_logs_per_smartlock)
         
+        # Authorization State Manager reference (will be set later)
+        self.auth_state_manager = None
+        
         # Setup authentication if provided
         if self.mqtt_username and self.mqtt_password:
             self.client.username_pw_set(self.mqtt_username, self.mqtt_password)
+    
+    # === UTILITY FUNCTIONS FOR ENABLED STATUS HANDLING ===
+    
+    def normalize_enabled_for_api(self, value) -> bool:
+        """Convert any enabled value to API format (boolean)"""
+        if value is None:
+            return True  # Default to enabled
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.lower() in ('1', 'true', 'yes', 'on', 'enabled')
+        return bool(value)
+    
+    def normalize_enabled_for_mqtt(self, value) -> int:
+        """Convert any enabled value to MQTT format (integer 0/1)"""
+        if value is None:
+            return 1  # Default to enabled
+        if isinstance(value, bool):
+            return 1 if value else 0
+        if isinstance(value, (int, float)):
+            return 1 if value else 0
+        if isinstance(value, str):
+            return 1 if value.lower() in ('1', 'true', 'yes', 'on', 'enabled') else 0
+        return 1 if value else 0
+    
+    def are_enabled_values_equal(self, value1, value2) -> bool:
+        """Compare two enabled values for equality (handles mixed types)"""
+        normalized1 = self.normalize_enabled_for_api(value1)
+        normalized2 = self.normalize_enabled_for_api(value2)
+        return normalized1 == normalized2
+    
+    def get_mqtt_latency_estimate(self, smartlock_id: int) -> float:
+        """Get estimated MQTT latency for adaptive timing"""
+        return self.mqtt_latency_tracker.get(smartlock_id, 2.0)  # Default 2s
+    
+    def set_auth_state_manager(self, auth_state_manager):
+        """Set the authorization state manager reference"""
+        self.auth_state_manager = auth_state_manager
+        logger.info("🔗 Authorization State Manager reference set for MQTT client")
     
     def connect(self):
         """Connect to MQTT broker"""
@@ -1274,27 +1330,105 @@ class MQTTClient:
             elif action == "update":
                 code_id = action_data.get("codeId")
                 if code_id:
-                    # ENHANCED: Process Time-Limited fields for updates too
-                    processed_data = self._process_time_limited_fields(action_data)
-                    self.data_store.update_keypad_code(smartlock_id, code_id, processed_data)
+                    # 🔒 ENHANCED STATE MANAGEMENT: Check if this is a restoration action
+                    unique_auth_id = f"{smartlock_id}_{code_id}"
+                    is_restoration = False
                     
-                    code_name = processed_data.get("name", "Unknown")
-                    time_limited = processed_data.get("timeLimited", 0)
-                    logger.info(f"✅ Updated keypad code {code_id} '{code_name}' for smartlock {smartlock_id} (timeLimited: {time_limited})")
+                    # 🔧 DEBUG: Check if this is from our own restoration system
+                    if self.auth_state_manager:
+                        # Check if this smartlock is in cooldown (indicating recent restoration)
+                        is_in_cooldown = self.auth_state_manager.is_in_cooldown(smartlock_id)
+                        cooldown_remaining = self.auth_state_manager.get_cooldown_remaining(smartlock_id)
+                        
+                        logger.warning(f"🔧 DEBUG MQTT UPDATE: is_in_cooldown={is_in_cooldown}, cooldown_remaining={cooldown_remaining:.2f}s")
+                        
+                        # If we're in cooldown period, this is likely our own restoration
+                        if is_in_cooldown:
+                            is_restoration = True
+                            logger.warning(f"🔧 DEBUG MQTT UPDATE: Detected restoration action for {unique_auth_id} (in cooldown)")
+                        else:
+                            logger.warning(f"🔧 DEBUG MQTT UPDATE: Not in cooldown, treating as normal update")
                     
-                    if time_limited == 1:
-                        logger.info(f"🕒 Updated Time-Limited fields: allowedFrom={processed_data.get('allowedFrom')}, " +
-                                  f"allowedUntil={processed_data.get('allowedUntil')}, " +
-                                  f"allowedWeekdays={processed_data.get('allowedWeekdays')}, " +
-                                  f"allowedFromTime={processed_data.get('allowedFromTime')}, " +
-                                  f"allowedUntilTime={processed_data.get('allowedUntilTime')}")
+                    # 🔒 ENHANCED STATE MANAGEMENT: Handle restoration vs normal updates differently
+                    if is_restoration:
+                        logger.info(f"🔧 PROCESSING RESTORATION ACTION for {unique_auth_id} - SKIPPING all state management")
+                        
+                        # ENHANCED: Process Time-Limited fields for restoration updates
+                        processed_data = self._process_time_limited_fields(action_data)
+                        self.data_store.update_keypad_code(smartlock_id, code_id, processed_data)
+                        
+                        code_name = processed_data.get("name", "Unknown")
+                        time_limited = processed_data.get("timeLimited", 0)
+                        logger.info(f"✅ RESTORATION: Updated keypad code {code_id} '{code_name}' for smartlock {smartlock_id} (timeLimited: {time_limited})")
+                        
+                        if time_limited == 1:
+                            logger.info(f"🕒 RESTORATION: Updated Time-Limited fields: allowedFrom={processed_data.get('allowedFrom')}, " +
+                                      f"allowedUntil={processed_data.get('allowedUntil')}, " +
+                                      f"allowedWeekdays={processed_data.get('allowedWeekdays')}, " +
+                                      f"allowedFromTime={processed_data.get('allowedFromTime')}, " +
+                                      f"allowedUntilTime={processed_data.get('allowedUntilTime')}")
+                        
+                        # NO state management for restoration actions - let them work!
+                        logger.info(f"🔧 RESTORATION COMPLETE: Skipping all state management for '{code_name}'")
+                        
+                    else:
+                        logger.info(f"🔄 PROCESSING NORMAL UPDATE for {unique_auth_id}")
+                        
+                        # Normal update: Remove old expected state before update
+                        if self.auth_state_manager:
+                            self.auth_state_manager.remove_authorization_from_expected_state(
+                                smartlock_id=smartlock_id,
+                                auth_id=unique_auth_id,
+                                reason="mqtt_update_before"
+                            )
+                            logger.info(f"🔄 Removed old authorization (ID: {unique_auth_id}) from expected state before MQTT update")
+                        
+                        # ENHANCED: Process Time-Limited fields for normal updates
+                        processed_data = self._process_time_limited_fields(action_data)
+                        self.data_store.update_keypad_code(smartlock_id, code_id, processed_data)
+                        
+                        code_name = processed_data.get("name", "Unknown")
+                        time_limited = processed_data.get("timeLimited", 0)
+                        logger.info(f"✅ NORMAL: Updated keypad code {code_id} '{code_name}' for smartlock {smartlock_id} (timeLimited: {time_limited})")
+                        
+                        if time_limited == 1:
+                            logger.info(f"🕒 NORMAL: Updated Time-Limited fields: allowedFrom={processed_data.get('allowedFrom')}, " +
+                                      f"allowedUntil={processed_data.get('allowedUntil')}, " +
+                                      f"allowedWeekdays={processed_data.get('allowedWeekdays')}, " +
+                                      f"allowedFromTime={processed_data.get('allowedFromTime')}, " +
+                                      f"allowedUntilTime={processed_data.get('allowedUntilTime')}")
+                        
+                        # Normal update: Save new state after update
+                        if self.auth_state_manager:
+                            import time
+                            time.sleep(0.5)  # Brief wait for data consistency
+                            current_auths = self.data_store.get_authorizations()
+                            self.auth_state_manager.save_current_state(
+                                smartlock_id=smartlock_id,
+                                authorizations=current_auths,
+                                source="mqtt_update",
+                                reason="after_keypad_mqtt_update"
+                            )
+                            logger.info(f"💾 Saved updated authorization state for '{code_name}' after MQTT update")
                 
             elif action == "delete":
                 code_id = action_data.get("codeId")
                 if code_id:
+                    # Generate the unique auth ID that would match our format
+                    unique_auth_id = f"{smartlock_id}_{code_id}"
+                    
                     # Delete from data store and get the code index for cleanup
                     code_index = self.data_store.delete_keypad_code(smartlock_id, code_id)
                     logger.info(f"🗑️ Deleted keypad code {code_id} for smartlock {smartlock_id} from data store")
+                    
+                    # 🔒 STATE MANAGEMENT: Remove from expected state to prevent auto-recreation
+                    if self.auth_state_manager:
+                        self.auth_state_manager.remove_authorization_from_expected_state(
+                            smartlock_id=smartlock_id,
+                            auth_id=unique_auth_id,
+                            reason="mqtt_delete"
+                        )
+                        logger.info(f"🗑️ Removed authorization (ID: {unique_auth_id}) from expected state after MQTT deletion")
                     
                     # Clean up specific MQTT topics for this keypad code
                     self.cleanup_keypad_code_mqtt_topics(smartlock_id, code_id, code_index)
@@ -1310,6 +1444,15 @@ class MQTTClient:
             # Publish updated keypad codes (this will reflect the changes)
             self.publish_keypad_codes(smartlock_id)
             self.publish_command_result(smartlock_id, "success")
+            
+            # 🔒 AUTH STATE MONITORING: Auto-restore monitoring after successful keypad operations
+            # WICHTIG: Bei DELETE-Operationen KEIN auto-restore aufrufen, da dies die gelöschten Codes wiederherstellen würde
+            if self.auth_state_manager and action in ["add", "update"]:
+                current_auths = self.data_store.get_authorizations()
+                self.auth_state_manager.auto_restore_if_needed(smartlock_id, current_auths)
+                logger.debug(f"🔍 Triggered auto-restore monitoring after keypad {action} on smartlock {smartlock_id}")
+            elif self.auth_state_manager and action == "delete":
+                logger.info(f"🗑️ Skipping auto-restore after DELETE operation to prevent restoration of deleted codes")
             
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON in keypad action: {e}")
@@ -1331,11 +1474,11 @@ class MQTTClient:
             action_data.get("allowedUntilTime")
         ])
         
-        # ENHANCED: Ensure timeLimited flag is set correctly
+        # ENHANCED: Ensure timeLimited flag is set correctly using utility function
         explicit_time_limited = action_data.get("timeLimited")
         if explicit_time_limited is not None:
-            # Use explicit value from the request
-            processed_data["timeLimited"] = int(explicit_time_limited)
+            # Use explicit value from the request, normalized
+            processed_data["timeLimited"] = self.normalize_enabled_for_mqtt(explicit_time_limited)
             logger.debug(f"Using explicit timeLimited value: {processed_data['timeLimited']}")
         elif has_time_restrictions:
             # Auto-set to 1 if time restrictions are present
@@ -1345,6 +1488,11 @@ class MQTTClient:
             # Default to 0 if no time restrictions
             processed_data["timeLimited"] = 0
             logger.debug(f"Setting timeLimited = 0 (no time restrictions)")
+        
+        # ENHANCED: Normalize enabled field using utility function
+        if "enabled" in action_data:
+            processed_data["enabled"] = self.normalize_enabled_for_mqtt(action_data["enabled"])
+            logger.debug(f"Normalized enabled field: {processed_data['enabled']}")
         
         # ENHANCED: Validate and normalize time-related fields
         if processed_data.get("timeLimited") == 1:
@@ -1580,6 +1728,12 @@ class MQTTClient:
             with self.data_store.lock:
                 self.data_store.keypad_codes[smartlock_id] = codes_data
             
+            # 🔒 AUTH STATE MONITORING: Auto-restore monitoring after keypad codes update
+            if self.auth_state_manager:
+                current_auths = self.data_store.get_authorizations()
+                self.auth_state_manager.auto_restore_if_needed(smartlock_id, current_auths)
+                logger.debug(f"🔍 Triggered auto-restore monitoring after keypad codes update on smartlock {smartlock_id}")
+            
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON in keypad codes update: {e}")
         except Exception as e:
@@ -1803,6 +1957,42 @@ class MQTTClient:
         self.client.publish(topic, json.dumps(auths), retain=True)
         logger.info(f"Published authorizations for smartlock {smartlock_id}")
     
+    def _handle_restoration_keypad_action(self, smartlock_id: int, payload: str):
+        """Handle restoration keypad actions with special processing that skips state management"""
+        try:
+            action_data = json.loads(payload)
+            action = action_data.get("action")
+            
+            logger.warning(f"🔧 PROCESSING RESTORATION ACTION: {action} for smartlock {smartlock_id}")
+            
+            if action == "update":
+                code_id = action_data.get("codeId")
+                if code_id:
+                    # Process Time-Limited fields for restoration
+                    processed_data = self._process_time_limited_fields(action_data)
+                    
+                    # PURE DATA UPDATE - NO state management calls
+                    self.data_store.update_keypad_code(smartlock_id, code_id, processed_data)
+                    
+                    code_name = processed_data.get("name", "Unknown")
+                    time_limited = processed_data.get("timeLimited", 0)
+                    logger.warning(f"🔧 RESTORATION COMPLETE: Updated '{code_name}' (timeLimited: {time_limited}) - NO state management")
+                    
+                    # IMPORTANT: Publish keypad codes without triggering auto-restore
+                    self.publish_keypad_codes(smartlock_id)
+                    
+                    # NO auth_state_manager calls here - this is restoration only!
+                    return
+            
+            # For non-update actions, fall back to normal handling
+            logger.warning(f"🔧 RESTORATION: Non-update action '{action}', falling back to normal processing")
+            self.handle_keypad_action(smartlock_id, payload)
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in restoration keypad action: {e}")
+        except Exception as e:
+            logger.error(f"Error in restoration keypad action: {e}")
+    
     def cleanup_keypad_code_mqtt_topics(self, smartlock_id: int, code_id: int, code_index: int = None):
         """Clean up specific MQTT topics for a deleted keypad code and update main keypad JSON"""
         if not self.connected:
@@ -1908,7 +2098,7 @@ class MQTTClient:
         self.handle_lock_action(smartlock_id, action)
     
     def publish_keypad_action(self, smartlock_id: int, action_data: dict):
-        """Publish keypad action to MQTT"""
+        """Publish keypad action to MQTT with immediate cooldown detection"""
         if not self.connected:
             logger.warning("MQTT not connected, cannot publish keypad action")
             # Still handle locally
@@ -1925,15 +2115,35 @@ class MQTTClient:
         
         payload = json.dumps(action_data)
         
-        # Track this message to avoid processing our own publication
-        message_hash = self._generate_message_hash(topic, payload)
-        self.published_messages.add(message_hash)
+        # 🔧 CRITICAL FIX: Check if this is a restoration action BEFORE local handling
+        action_type = action_data.get('action', '')
+        is_restoration_action = False
+        
+        if action_type == 'update' and self.auth_state_manager:
+            # Check if this smartlock is in cooldown (indicating recent restoration)
+            is_in_cooldown = self.auth_state_manager.is_in_cooldown(smartlock_id)
+            if is_in_cooldown:
+                is_restoration_action = True
+                cooldown_remaining = self.auth_state_manager.get_cooldown_remaining(smartlock_id)
+                logger.warning(f"🔧 LOCAL RESTORATION DETECTION: is_in_cooldown=True, cooldown_remaining={cooldown_remaining:.2f}s")
+                logger.warning(f"🔧 LOCAL RESTORATION DETECTION: Detected restoration action for smartlock {smartlock_id}")
+        
+        # Track message for MQTT echo filtering (but not for restoration actions)
+        if not is_restoration_action:
+            message_hash = self._generate_message_hash(topic, payload)
+            self.published_messages.add(message_hash)
         
         self.client.publish(topic, payload)
         logger.info(f"Published keypad action to {topic}: {payload}")
         
-        # Handle locally ONLY - don't rely on MQTT echo
-        self.handle_keypad_action(smartlock_id, payload)
+        # 🔧 CRITICAL FIX: Handle locally with restoration flag
+        if is_restoration_action:
+            logger.warning(f"🔧 PROCESSING LOCAL RESTORATION ACTION for smartlock {smartlock_id} - SKIPPING state management")
+            # Call handle_keypad_action with special restoration handling
+            self._handle_restoration_keypad_action(smartlock_id, payload)
+        else:
+            # Normal local handling
+            self.handle_keypad_action(smartlock_id, payload)
     
     def publish_timecontrol_action(self, smartlock_id: int, action_data: dict):
         """Publish timecontrol action to MQTT"""
@@ -2055,6 +2265,184 @@ class MQTTClient:
         # Also handle locally to ensure we have data
         self.handle_query_action(smartlock_id, query_type, "1")
     
+    def start_authorization_verification_thread(self, smartlock_id: int, expected_name: str, expected_enabled: bool, expected_code: int = None, max_attempts: int = 5):
+        """Start a verification thread to ensure authorization enabled state is correctly set"""
+        
+        verification_data = {
+            "smartlock_id": smartlock_id,
+            "expected_name": expected_name,
+            "expected_enabled": expected_enabled,
+            "expected_code": expected_code,
+            "max_attempts": max_attempts,
+            "attempt_count": 0
+        }
+        
+        # Generate unique verification ID
+        verification_id = f"{smartlock_id}_{expected_name}_{expected_code}_{int(time.time())}"
+        
+        with self.verification_lock:
+            self.pending_verifications[verification_id] = verification_data
+        
+        # Start verification thread
+        thread = threading.Thread(
+            target=self._authorization_verification_worker,
+            args=(verification_id,),
+            daemon=True,
+            name=f"AuthVerification-{smartlock_id}-{expected_name}"
+        )
+        thread.start()
+        
+        logger.info(f"🔍 Started verification thread for authorization '{expected_name}' on smartlock {smartlock_id} (expected enabled: {expected_enabled})")
+    
+    def _authorization_verification_worker(self, verification_id: str):
+        """Worker thread that verifies and corrects authorization enabled state"""
+        try:
+            with self.verification_lock:
+                verification_data = self.pending_verifications.get(verification_id)
+                if not verification_data:
+                    logger.warning(f"Verification data not found for ID: {verification_id}")
+                    return
+            
+            smartlock_id = verification_data["smartlock_id"]
+            expected_name = verification_data["expected_name"]
+            expected_enabled = verification_data["expected_enabled"]
+            expected_code = verification_data["expected_code"]
+            max_attempts = verification_data["max_attempts"]
+            
+            logger.info(f"🔍 Starting verification for '{expected_name}' on smartlock {smartlock_id}")
+            
+            # Wait initial delay to allow MQTT processing
+            initial_delay = 3.0
+            time.sleep(initial_delay)
+            
+            for attempt in range(max_attempts):
+                try:
+                    # Find the authorization in current data
+                    current_auth = self._find_authorization_by_criteria(smartlock_id, expected_name, expected_code)
+                    
+                    if not current_auth:
+                        logger.warning(f"🔍 Attempt {attempt + 1}: Authorization '{expected_name}' not found yet on smartlock {smartlock_id}")
+                        if attempt < max_attempts - 1:
+                            time.sleep(2.0)
+                            continue
+                        else:
+                            logger.error(f"❌ Verification failed: Authorization '{expected_name}' not found after {max_attempts} attempts")
+                            break
+                    
+                    current_enabled = current_auth.get("enabled", True)
+                    
+                    # Check if enabled state matches expectation
+                    if bool(current_enabled) == bool(expected_enabled):
+                        logger.info(f"✅ Verification successful: '{expected_name}' has correct enabled state ({expected_enabled}) on smartlock {smartlock_id}")
+                        break
+                    else:
+                        logger.warning(f"🔧 Attempt {attempt + 1}: Authorization '{expected_name}' has incorrect enabled state. Expected: {expected_enabled}, Found: {current_enabled}")
+                        
+                        # Send correction MQTT message
+                        self._send_authorization_correction(smartlock_id, current_auth, expected_enabled)
+                        
+                        if attempt < max_attempts - 1:
+                            # Wait before next attempt
+                            retry_delay = 2.0 + (attempt * 0.5)  # Increasing delay
+                            time.sleep(retry_delay)
+                        else:
+                            logger.error(f"❌ Verification failed: Unable to correct enabled state for '{expected_name}' after {max_attempts} attempts")
+                
+                except Exception as e:
+                    logger.error(f"Error in verification attempt {attempt + 1}: {e}")
+                    if attempt < max_attempts - 1:
+                        time.sleep(2.0)
+            
+        except Exception as e:
+            logger.error(f"Error in authorization verification worker: {e}")
+        finally:
+            # Clean up verification data
+            with self.verification_lock:
+                if verification_id in self.pending_verifications:
+                    del self.pending_verifications[verification_id]
+    
+    def _find_authorization_by_criteria(self, smartlock_id: int, name: str, code: int = None) -> Optional[Dict[str, Any]]:
+        """Find authorization by smartlock_id, name, and optionally code"""
+        try:
+            # Get current authorizations
+            current_auths = self.data_store.get_authorizations()
+            
+            # Filter by smartlock_id and name
+            matching_auths = [
+                auth for auth in current_auths
+                if (auth.get("smartlockId") == smartlock_id and 
+                    auth.get("name") == name)
+            ]
+            
+            if not matching_auths:
+                return None
+            
+            # If code is specified, further filter by code
+            if code is not None:
+                code_matching = [
+                    auth for auth in matching_auths
+                    if auth.get("code") == code
+                ]
+                if code_matching:
+                    return code_matching[0]  # Return first match
+            
+            # Return first match if no code filtering or no code matches
+            return matching_auths[0]
+            
+        except Exception as e:
+            logger.error(f"Error finding authorization: {e}")
+            return None
+    
+    def _send_authorization_correction(self, smartlock_id: int, current_auth: Dict[str, Any], expected_enabled: bool):
+        """Send MQTT correction message to fix authorization enabled state"""
+        try:
+            auth_type = current_auth.get("type", 13)
+            
+            if auth_type == 13:  # Keypad code
+                # Extract code ID for keypad correction
+                auth_id = current_auth.get("id", "")
+                code_id = None
+                
+                if "_" in auth_id:
+                    # Format: "smartlock_id_code_id"
+                    parts = auth_id.split("_")
+                    if len(parts) == 2 and parts[1].isdigit():
+                        code_id = int(parts[1])
+                
+                if code_id is None:
+                    logger.error(f"Could not extract code ID from auth ID: {auth_id}")
+                    return
+                
+                # Prepare correction action
+                correction_action = {
+                    "action": "update",
+                    "codeId": code_id,
+                    "name": current_auth.get("name"),
+                    "enabled": 1 if expected_enabled else 0
+                }
+                
+                logger.info(f"🔧 Sending keypad correction for smartlock {smartlock_id}: {correction_action}")
+                self.publish_keypad_action(smartlock_id, correction_action)
+                
+            else:
+                # Regular authorization correction
+                auth_id = current_auth.get("authId")
+                if auth_id:
+                    correction_action = {
+                        "action": "update",
+                        "authId": auth_id,
+                        "name": current_auth.get("name"),
+                        "enabled": 1 if expected_enabled else 0
+                    }
+                    
+                    logger.info(f"🔧 Sending authorization correction for smartlock {smartlock_id}: {correction_action}")
+                    self.publish_authorization_action(smartlock_id, correction_action)
+                else:
+                    logger.error(f"Could not find authId for correction: {current_auth}")
+                    
+        except Exception as e:
+            logger.error(f"Error sending authorization correction: {e}")
+
     def disconnect(self):
         """Disconnect from MQTT broker"""
         if self.connected:
