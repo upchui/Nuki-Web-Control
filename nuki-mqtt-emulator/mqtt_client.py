@@ -930,6 +930,10 @@ class MQTTClient:
         # Track our own published messages to avoid processing them
         self.published_messages = set()  # Track message hashes to avoid self-processing
         
+        # Authorization verification tracking
+        self.pending_verifications = {}  # auth_id -> verification_data
+        self.verification_lock = threading.RLock()
+        
         # Connection state
         self.connected = False
         self.reconnect_delay = 5
@@ -2055,6 +2059,184 @@ class MQTTClient:
         # Also handle locally to ensure we have data
         self.handle_query_action(smartlock_id, query_type, "1")
     
+    def start_authorization_verification_thread(self, smartlock_id: int, expected_name: str, expected_enabled: bool, expected_code: int = None, max_attempts: int = 5):
+        """Start a verification thread to ensure authorization enabled state is correctly set"""
+        
+        verification_data = {
+            "smartlock_id": smartlock_id,
+            "expected_name": expected_name,
+            "expected_enabled": expected_enabled,
+            "expected_code": expected_code,
+            "max_attempts": max_attempts,
+            "attempt_count": 0
+        }
+        
+        # Generate unique verification ID
+        verification_id = f"{smartlock_id}_{expected_name}_{expected_code}_{int(time.time())}"
+        
+        with self.verification_lock:
+            self.pending_verifications[verification_id] = verification_data
+        
+        # Start verification thread
+        thread = threading.Thread(
+            target=self._authorization_verification_worker,
+            args=(verification_id,),
+            daemon=True,
+            name=f"AuthVerification-{smartlock_id}-{expected_name}"
+        )
+        thread.start()
+        
+        logger.info(f"🔍 Started verification thread for authorization '{expected_name}' on smartlock {smartlock_id} (expected enabled: {expected_enabled})")
+    
+    def _authorization_verification_worker(self, verification_id: str):
+        """Worker thread that verifies and corrects authorization enabled state"""
+        try:
+            with self.verification_lock:
+                verification_data = self.pending_verifications.get(verification_id)
+                if not verification_data:
+                    logger.warning(f"Verification data not found for ID: {verification_id}")
+                    return
+            
+            smartlock_id = verification_data["smartlock_id"]
+            expected_name = verification_data["expected_name"]
+            expected_enabled = verification_data["expected_enabled"]
+            expected_code = verification_data["expected_code"]
+            max_attempts = verification_data["max_attempts"]
+            
+            logger.info(f"🔍 Starting verification for '{expected_name}' on smartlock {smartlock_id}")
+            
+            # Wait initial delay to allow MQTT processing
+            initial_delay = 3.0
+            time.sleep(initial_delay)
+            
+            for attempt in range(max_attempts):
+                try:
+                    # Find the authorization in current data
+                    current_auth = self._find_authorization_by_criteria(smartlock_id, expected_name, expected_code)
+                    
+                    if not current_auth:
+                        logger.warning(f"🔍 Attempt {attempt + 1}: Authorization '{expected_name}' not found yet on smartlock {smartlock_id}")
+                        if attempt < max_attempts - 1:
+                            time.sleep(2.0)
+                            continue
+                        else:
+                            logger.error(f"❌ Verification failed: Authorization '{expected_name}' not found after {max_attempts} attempts")
+                            break
+                    
+                    current_enabled = current_auth.get("enabled", True)
+                    
+                    # Check if enabled state matches expectation
+                    if bool(current_enabled) == bool(expected_enabled):
+                        logger.info(f"✅ Verification successful: '{expected_name}' has correct enabled state ({expected_enabled}) on smartlock {smartlock_id}")
+                        break
+                    else:
+                        logger.warning(f"🔧 Attempt {attempt + 1}: Authorization '{expected_name}' has incorrect enabled state. Expected: {expected_enabled}, Found: {current_enabled}")
+                        
+                        # Send correction MQTT message
+                        self._send_authorization_correction(smartlock_id, current_auth, expected_enabled)
+                        
+                        if attempt < max_attempts - 1:
+                            # Wait before next attempt
+                            retry_delay = 2.0 + (attempt * 0.5)  # Increasing delay
+                            time.sleep(retry_delay)
+                        else:
+                            logger.error(f"❌ Verification failed: Unable to correct enabled state for '{expected_name}' after {max_attempts} attempts")
+                
+                except Exception as e:
+                    logger.error(f"Error in verification attempt {attempt + 1}: {e}")
+                    if attempt < max_attempts - 1:
+                        time.sleep(2.0)
+            
+        except Exception as e:
+            logger.error(f"Error in authorization verification worker: {e}")
+        finally:
+            # Clean up verification data
+            with self.verification_lock:
+                if verification_id in self.pending_verifications:
+                    del self.pending_verifications[verification_id]
+    
+    def _find_authorization_by_criteria(self, smartlock_id: int, name: str, code: int = None) -> Optional[Dict[str, Any]]:
+        """Find authorization by smartlock_id, name, and optionally code"""
+        try:
+            # Get current authorizations
+            current_auths = self.data_store.get_authorizations()
+            
+            # Filter by smartlock_id and name
+            matching_auths = [
+                auth for auth in current_auths
+                if (auth.get("smartlockId") == smartlock_id and 
+                    auth.get("name") == name)
+            ]
+            
+            if not matching_auths:
+                return None
+            
+            # If code is specified, further filter by code
+            if code is not None:
+                code_matching = [
+                    auth for auth in matching_auths
+                    if auth.get("code") == code
+                ]
+                if code_matching:
+                    return code_matching[0]  # Return first match
+            
+            # Return first match if no code filtering or no code matches
+            return matching_auths[0]
+            
+        except Exception as e:
+            logger.error(f"Error finding authorization: {e}")
+            return None
+    
+    def _send_authorization_correction(self, smartlock_id: int, current_auth: Dict[str, Any], expected_enabled: bool):
+        """Send MQTT correction message to fix authorization enabled state"""
+        try:
+            auth_type = current_auth.get("type", 13)
+            
+            if auth_type == 13:  # Keypad code
+                # Extract code ID for keypad correction
+                auth_id = current_auth.get("id", "")
+                code_id = None
+                
+                if "_" in auth_id:
+                    # Format: "smartlock_id_code_id"
+                    parts = auth_id.split("_")
+                    if len(parts) == 2 and parts[1].isdigit():
+                        code_id = int(parts[1])
+                
+                if code_id is None:
+                    logger.error(f"Could not extract code ID from auth ID: {auth_id}")
+                    return
+                
+                # Prepare correction action
+                correction_action = {
+                    "action": "update",
+                    "codeId": code_id,
+                    "name": current_auth.get("name"),
+                    "enabled": 1 if expected_enabled else 0
+                }
+                
+                logger.info(f"🔧 Sending keypad correction for smartlock {smartlock_id}: {correction_action}")
+                self.publish_keypad_action(smartlock_id, correction_action)
+                
+            else:
+                # Regular authorization correction
+                auth_id = current_auth.get("authId")
+                if auth_id:
+                    correction_action = {
+                        "action": "update",
+                        "authId": auth_id,
+                        "name": current_auth.get("name"),
+                        "enabled": 1 if expected_enabled else 0
+                    }
+                    
+                    logger.info(f"🔧 Sending authorization correction for smartlock {smartlock_id}: {correction_action}")
+                    self.publish_authorization_action(smartlock_id, correction_action)
+                else:
+                    logger.error(f"Could not find authId for correction: {current_auth}")
+                    
+        except Exception as e:
+            logger.error(f"Error sending authorization correction: {e}")
+
     def disconnect(self):
         """Disconnect from MQTT broker"""
         if self.connected:

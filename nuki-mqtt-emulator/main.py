@@ -379,6 +379,16 @@ def create_smartlock_auth(auth: SmartlockAuthCreate):
                 
                 if created_auth:
                     created_auths.append(created_auth)
+                    
+                    # ENHANCED: Start verification thread to ensure enabled state is correct
+                    mqtt_client.start_authorization_verification_thread(
+                        smartlock_id=smartlock_id,
+                        expected_name=auth.name,
+                        expected_enabled=auth.enabled,
+                        expected_code=auth.code,
+                        max_attempts=5
+                    )
+                    logger.info(f"🔍 Started verification thread for '{auth.name}' on smartlock {smartlock_id}")
                 else:
                     # Create a fallback response but mark as failed
                     created_auth = {
@@ -511,6 +521,17 @@ def update_smartlock_auth(smartlock_id: int, auth_id: str, auth: SmartlockAuthUp
         # This is a keypad code - use keypad action
         action_data = _convert_api_to_mqtt_keypad(auth, auth_id)
         mqtt_client.publish_keypad_action(smartlock_id, action_data)
+        
+        # ENHANCED: Start verification thread for keypad code updates
+        if auth.enabled is not None:
+            mqtt_client.start_authorization_verification_thread(
+                smartlock_id=smartlock_id,
+                expected_name=auth.name,
+                expected_enabled=auth.enabled,
+                expected_code=auth.code,
+                max_attempts=3
+            )
+            logger.info(f"🔍 Started verification thread for keypad update '{auth.name}' on smartlock {smartlock_id}")
     else:
         # Regular authorization - use authorization action
         action_data = {
@@ -537,6 +558,17 @@ def update_smartlock_auth(smartlock_id: int, auth_id: str, auth: SmartlockAuthUp
             action_data["remoteAllowed"] = 1 if auth.remoteAllowed else 0
         
         mqtt_client.publish_authorization_action(smartlock_id, action_data)
+        
+        # ENHANCED: Start verification thread for regular authorization updates
+        if auth.enabled is not None:
+            mqtt_client.start_authorization_verification_thread(
+                smartlock_id=smartlock_id,
+                expected_name=auth.name,
+                expected_enabled=auth.enabled,
+                expected_code=auth.code,
+                max_attempts=3
+            )
+            logger.info(f"🔍 Started verification thread for authorization update '{auth.name}' on smartlock {smartlock_id}")
     
     return {"message": "Authorization updated successfully"}
 
