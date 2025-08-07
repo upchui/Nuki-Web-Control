@@ -609,105 +609,92 @@ def _convert_api_to_mqtt_keypad(auth: SmartlockAuthUpdate, auth_id: str) -> dict
 
 @app.delete("/smartlock/auth")
 def delete_smartlock_auth(auth_ids: list[str]):
-    """Delete smartlock authorizations - finds all auths with same name+code across all smartlocks"""
+    """Delete smartlock authorizations - deletes only from specific smartlocks based on auth_id"""
     
     deleted_auths = []
     failed_deletions = []
-    processed_combinations = set()  # To avoid deleting the same name+code combination multiple times
     
     import time
     
     for auth_id in auth_ids:
         try:
-            # Get the first authorization to understand what we're looking for
-            target_auth = mqtt_client.data_store.get_authorization_safe(auth_id)
-            if not target_auth:
-                failed_deletions.append({"id": auth_id, "reason": "Authorization not found"})
-                continue
+            logger.info(f"🗑️ Processing deletion request for auth_id: {auth_id}")
             
-            target_name = target_auth.get("name", "")
-            target_code = target_auth.get("code")
-            target_type = target_auth.get("type", 13)  # Assume keypad type if not specified
+            # Parse auth_id to extract smartlock_id and code_id
+            if "_" in auth_id:
+                # New format: "smartlock_id_code_id"
+                parts = auth_id.split("_")
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    target_smartlock_id = int(parts[0])
+                    target_code_id = int(parts[1])
+                else:
+                    failed_deletions.append({"id": auth_id, "reason": "Invalid auth_id format"})
+                    continue
+            else:
+                # Old format or invalid - try to find the authorization first
+                target_auth = mqtt_client.data_store.get_authorization_safe(auth_id)
+                if not target_auth:
+                    failed_deletions.append({"id": auth_id, "reason": "Authorization not found"})
+                    continue
+                
+                target_smartlock_id = target_auth.get("smartlockId")
+                # Extract code_id from the auth_id or authId
+                if auth_id.isdigit():
+                    target_code_id = int(auth_id)
+                else:
+                    failed_deletions.append({"id": auth_id, "reason": "Cannot determine code_id from auth_id"})
+                    continue
             
-            # Create a unique key for this name+code combination
-            combination_key = f"{target_name}_{target_code}_{target_type}"
+            logger.info(f"🎯 Deleting from smartlock {target_smartlock_id}, code_id {target_code_id}")
             
-            # Skip if we already processed this combination
-            if combination_key in processed_combinations:
-                logger.info(f"Skipping {auth_id} - already processed combination: {target_name} (code: {target_code})")
-                continue
-            
-            processed_combinations.add(combination_key)
-            
-            logger.info(f"🔍 Searching for ALL keypad codes with name='{target_name}' and code={target_code} across all smartlocks")
-            
-            # FIXED: Search directly in keypad_codes instead of deduplicated authorizations
-            matching_codes = []
+            # Find the specific keypad code in the target smartlock
+            target_code = None
             with mqtt_client.data_store.lock:
-                for smartlock_id, codes in mqtt_client.data_store.keypad_codes.items():
-                    for code in codes:
-                        if (code.get("name") == target_name and 
-                            code.get("code") == target_code):
-                            # Add smartlock_id to the code for reference
-                            code_with_smartlock = code.copy()
-                            code_with_smartlock["smartlockId"] = smartlock_id
-                            matching_codes.append(code_with_smartlock)
+                codes = mqtt_client.data_store.keypad_codes.get(target_smartlock_id, [])
+                for code in codes:
+                    if code.get("codeId") == target_code_id:
+                        target_code = code
+                        break
             
-            logger.info(f"📋 Found {len(matching_codes)} matching keypad codes to delete:")
-            for code in matching_codes:
-                logger.info(f"  - CodeId: {code.get('codeId')}, Smartlock: {code.get('smartlockId')}, Name: {code.get('name')}, Code: {code.get('code')}")
+            if not target_code:
+                failed_deletions.append({
+                    "id": auth_id,
+                    "smartlockId": target_smartlock_id,
+                    "reason": f"Keypad code {target_code_id} not found in smartlock {target_smartlock_id}"
+                })
+                continue
             
-            # Delete all matching keypad codes
-            for code in matching_codes:
-                try:
-                    smartlock_id = code.get("smartlockId")
-                    code_id = code.get("codeId")
-                    auth_name = code.get("name", "Unknown")
-                    code_value = code.get("code")
-                    
-                    if code_id is None:
-                        failed_deletions.append({
-                            "smartlockId": smartlock_id,
-                            "reason": "Missing codeId in keypad code",
-                            "name": auth_name
-                        })
-                        continue
-                    
-                    action_data = {
-                        "action": "delete",
-                        "codeId": code_id
-                    }
-                    
-                    logger.info(f"🗑️  Deleting keypad code from smartlock {smartlock_id}: CodeId={code_id}, Name='{auth_name}', Code={code_value}")
-                    mqtt_client.publish_keypad_action(smartlock_id, action_data)
-                    
-                    # ENHANCED: Also clean up specific MQTT topics for this keypad code
-                    code_index = code.get("index")  # Get the index for targeted cleanup
-                    mqtt_client.cleanup_keypad_code_mqtt_topics(smartlock_id, code_id, code_index)
-                    logger.info(f"🧹 Cleaned up MQTT topics for deleted keypad code {code_id} (index: {code_index})")
-                    
-                    # Generate the unique ID for response (same format as API uses)
-                    unique_id = f"{smartlock_id}_{code_id}"
-                    
-                    deleted_auths.append({
-                        "id": unique_id,
-                        "name": auth_name,
-                        "smartlockId": smartlock_id,
-                        "type": "keypad",
-                        "code": code_value,
-                        "codeId": code_id
-                    })
-                    
-                    # Wait between deletions to avoid MQTT flooding
-                    time.sleep(0.2)
-                    
-                except Exception as e:
-                    logger.error(f"Failed to delete keypad code from smartlock {code.get('smartlockId')}: {e}")
-                    failed_deletions.append({
-                        "smartlockId": code.get("smartlockId"), 
-                        "reason": f"Deletion error: {e}",
-                        "name": code.get("name", "Unknown")
-                    })
+            # Delete the specific keypad code
+            auth_name = target_code.get("name", "Unknown")
+            code_value = target_code.get("code")
+            
+            action_data = {
+                "action": "delete",
+                "codeId": target_code_id
+            }
+            
+            logger.info(f"🗑️ Deleting keypad code from smartlock {target_smartlock_id}: CodeId={target_code_id}, Name='{auth_name}', Code={code_value}")
+            mqtt_client.publish_keypad_action(target_smartlock_id, action_data)
+            
+            # Clean up specific MQTT topics for this keypad code
+            code_index = target_code.get("index")  # Get the index for targeted cleanup
+            mqtt_client.cleanup_keypad_code_mqtt_topics(target_smartlock_id, target_code_id, code_index)
+            logger.info(f"🧹 Cleaned up MQTT topics for deleted keypad code {target_code_id} (index: {code_index})")
+            
+            # Generate the unique ID for response (same format as API uses)
+            unique_id = f"{target_smartlock_id}_{target_code_id}"
+            
+            deleted_auths.append({
+                "id": unique_id,
+                "name": auth_name,
+                "smartlockId": target_smartlock_id,
+                "type": "keypad",
+                "code": code_value,
+                "codeId": target_code_id
+            })
+            
+            # Wait between deletions to avoid MQTT flooding
+            time.sleep(0.2)
                     
         except Exception as e:
             logger.error(f"Unexpected error processing auth_id {auth_id}: {e}")
@@ -715,7 +702,7 @@ def delete_smartlock_auth(auth_ids: list[str]):
     
     # Prepare response with detailed information
     response = {
-        "message": f"Successfully deleted {len(deleted_auths)} keypad code(s) with matching name+code from all smartlocks",
+        "message": f"Successfully deleted {len(deleted_auths)} keypad code(s) from specific smartlocks",
         "deleted": deleted_auths,
         "deleted_count": len(deleted_auths)
     }
@@ -725,18 +712,11 @@ def delete_smartlock_auth(auth_ids: list[str]):
         response["failed_count"] = len(failed_deletions)
         response["message"] += f", {len(failed_deletions)} failed"
     
-    # Group deleted auths by name+code for better logging
+    # Log individual deletions for better visibility
     if deleted_auths:
-        grouped_deletions = {}
-        for auth in deleted_auths:
-            key = f"{auth['name']} (code: {auth['code']})"
-            if key not in grouped_deletions:
-                grouped_deletions[key] = []
-            grouped_deletions[key].append(auth['smartlockId'])
-        
         logger.info("✅ DELETION SUMMARY:")
-        for name_code, smartlock_ids in grouped_deletions.items():
-            logger.info(f"  - {name_code}: deleted from smartlocks {smartlock_ids}")
+        for auth in deleted_auths:
+            logger.info(f"  - Deleted '{auth['name']}' (code: {auth['code']}) from smartlock {auth['smartlockId']}")
     
     return response
 
